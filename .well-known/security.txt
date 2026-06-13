@@ -1,0 +1,7 @@
+Contact: mailto:admin@apasaja.my
+Contact: https://security.apasaja.my/contact
+Encryption: https://security.apasaja.my/.well-known/pgp-key.txt
+Preferred-Languages: ms, en
+Canonical: https://security.apasaja.my/.well-known/security.txt
+Policy: https://security.apasaja.my/security-policy
+Expires: 2027-04-30T23:59:59+08:00

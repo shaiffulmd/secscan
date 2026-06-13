@@ -1,0 +1,33 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data
+data/*
+!data/.htaccess
+!data/index.html
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.bak
+*.bak.*
+*.backup
+*.old
+*.orig
+
+# Dependencies and build output
+vendor/
+node_modules/
+dist/
+build/
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/

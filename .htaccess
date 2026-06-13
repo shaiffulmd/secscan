@@ -1,0 +1,15 @@
+Options -Indexes
+
+<FilesMatch "(\.bak|\.db|\.sqlite|\.sql|\.log|\.env|composer\.(json|lock)|README\.md)$">
+    Require all denied
+</FilesMatch>
+
+<FilesMatch "^(config\.php)$">
+    Require all denied
+</FilesMatch>
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^data/ - [F,L]
+    RewriteRule ^src/ - [F,L]
+</IfModule>
