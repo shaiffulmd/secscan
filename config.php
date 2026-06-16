@@ -34,6 +34,8 @@ function secscan_load_dotenv(): void
     }
     $candidates[] = __DIR__ . '/.env';
     $candidates[] = dirname(__DIR__) . '/.env';
+    // Explicit deployment location (this server keeps .env above the web root).
+    $candidates[] = '/home/security/.env';
 
     $path = null;
     foreach ($candidates as $candidate) {
