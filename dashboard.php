@@ -174,7 +174,7 @@ $totalPages = (int)ceil($totalCount / $pageSize);
   --void:    #020508; --base: #050d18; --surface: #091525;
   --elevated:#0e1f33; --high: #132840;
   --border:  rgba(0,220,180,.08); --border2: rgba(0,220,180,.18); --border3: rgba(0,220,180,.32);
-  --t1: #cde8f8; --t2: #5a8aaa; --t3: #2a4560;
+  --t1: #cde8f8; --t2: #93b6d6; --t3: #6f93b5;
   --mint: #00ffcc; --mint2: rgba(0,255,204,.08);
   --sky:  #38bdf8; --rose: #f43f5e; --amber: #f59e0b; --green: #22c55e;
   --f-title: system-ui, -apple-system, sans-serif;
