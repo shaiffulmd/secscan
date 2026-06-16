@@ -6,6 +6,85 @@
  * Environment variables override these defaults. For production, set at least:
  * SECSCAN_DASHBOARD_PASSWORD_HASH and SECSCAN_IP_HASH_SALT.
  */
+
+/**
+ * Load a local .env file into the process environment.
+ *
+ * The app reads config via getenv(); on hosts where you cannot set FPM/systemd
+ * environment variables (shared/cPanel hosting) this lets a .env file supply
+ * them. Lookup order: $SECSCAN_ENV_FILE, then ./.env next to this file, then
+ * ../.env one level above the web root (the safest place — not web-reachable).
+ *
+ * Real environment variables ALWAYS win — a .env value never overrides one that
+ * is already set. Values are read literally (no shell/`$` expansion), so bcrypt
+ * hashes are safe. The file is also denied by .htaccess when kept in the root.
+ */
+function secscan_load_dotenv(): void
+{
+    static $loaded = false;
+    if ($loaded) {
+        return;
+    }
+    $loaded = true;
+
+    $candidates = [];
+    $explicit = getenv('SECSCAN_ENV_FILE');
+    if (is_string($explicit) && $explicit !== '') {
+        $candidates[] = $explicit;
+    }
+    $candidates[] = __DIR__ . '/.env';
+    $candidates[] = dirname(__DIR__) . '/.env';
+
+    $path = null;
+    foreach ($candidates as $candidate) {
+        if (is_string($candidate) && $candidate !== '' && is_readable($candidate)) {
+            $path = $candidate;
+            break;
+        }
+    }
+    if ($path === null) {
+        return;
+    }
+
+    $lines = @file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if ($lines === false) {
+        return;
+    }
+
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if ($line === '' || $line[0] === '#') {
+            continue;
+        }
+        if (strncmp($line, 'export ', 7) === 0) {
+            $line = ltrim(substr($line, 7));
+        }
+        $eq = strpos($line, '=');
+        if ($eq === false) {
+            continue;
+        }
+        $key = trim(substr($line, 0, $eq));
+        if (!preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $key)) {
+            continue;
+        }
+        // Never override an environment variable that is already set.
+        if (getenv($key) !== false || array_key_exists($key, $_ENV) || array_key_exists($key, $_SERVER)) {
+            continue;
+        }
+        $value = trim(substr($line, $eq + 1));
+        if (strlen($value) >= 2) {
+            $q = $value[0];
+            if (($q === '"' || $q === "'") && $value[strlen($value) - 1] === $q) {
+                $value = substr($value, 1, -1);
+            }
+        }
+        putenv("{$key}={$value}");
+        $_ENV[$key] = $value;
+    }
+}
+
+secscan_load_dotenv();
+
 function secscan_env(string $key, ?string $default = null): ?string
 {
     $value = getenv($key);
