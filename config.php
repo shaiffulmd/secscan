@@ -32,6 +32,12 @@ function secscan_config(?string $key = null)
             'api_rate_limit' => (int)secscan_env('SECSCAN_API_RATE_LIMIT', '5'),
             'api_rate_window' => (int)secscan_env('SECSCAN_API_RATE_WINDOW', '60'),
             'max_url_length' => (int)secscan_env('SECSCAN_MAX_URL_LENGTH', '2048'),
+            // Reverse proxies / load balancers whose forwarded client-IP headers
+            // may be trusted. Comma-separated list of IPs or CIDR ranges (v4/v6).
+            // Empty = trust nothing (forwarded headers ignored; REMOTE_ADDR used).
+            'trusted_proxies' => secscan_env('SECSCAN_TRUSTED_PROXIES', ''),
+            // Set to "1" to additionally trust Cloudflare's published edge ranges.
+            'trust_cloudflare' => secscan_env('SECSCAN_TRUST_CLOUDFLARE', '0'),
         ];
     }
 
@@ -42,19 +48,35 @@ function secscan_config(?string $key = null)
     return $config[$key] ?? null;
 }
 
+/**
+ * Best-effort client IP for rate limiting and analytics.
+ *
+ * SECURITY: Forwarded headers (CF-Connecting-IP, X-Real-IP, X-Forwarded-For) are
+ * trivially spoofable by the client. They are ONLY honoured when the direct peer
+ * (REMOTE_ADDR) is a configured trusted proxy; otherwise REMOTE_ADDR is used.
+ * Trusting these headers unconditionally would let anyone forge an IP per request
+ * to bypass per-IP rate limits or poison the dashboard's unique-IP counts.
+ */
 function secscan_client_ip(): string
 {
+    $remote = trim((string)($_SERVER['REMOTE_ADDR'] ?? ''));
+    $fallback = filter_var($remote, FILTER_VALIDATE_IP) ? $remote : 'unknown';
+
+    if (!secscan_is_trusted_proxy($remote)) {
+        return $fallback;
+    }
+
     foreach ([
         $_SERVER['HTTP_CF_CONNECTING_IP'] ?? '',
         $_SERVER['HTTP_X_REAL_IP'] ?? '',
         $_SERVER['HTTP_X_FORWARDED_FOR'] ?? '',
-        $_SERVER['REMOTE_ADDR'] ?? '',
     ] as $candidate) {
         $candidate = trim((string)$candidate);
         if ($candidate === '') {
             continue;
         }
         if (str_contains($candidate, ',')) {
+            // X-Forwarded-For: the original client is the left-most entry.
             $candidate = trim(explode(',', $candidate)[0]);
         }
         if (filter_var($candidate, FILTER_VALIDATE_IP)) {
@@ -62,5 +84,120 @@ function secscan_client_ip(): string
         }
     }
 
-    return 'unknown';
+    return $fallback;
+}
+
+/**
+ * Is the request's direct peer one of the configured trusted reverse proxies?
+ * Reads SECSCAN_TRUSTED_PROXIES (comma-separated IPs/CIDRs) plus, when
+ * SECSCAN_TRUST_CLOUDFLARE=1, Cloudflare's published edge ranges.
+ */
+function secscan_is_trusted_proxy(string $ip): bool
+{
+    if ($ip === '' || !filter_var($ip, FILTER_VALIDATE_IP)) {
+        return false;
+    }
+
+    $ranges = array_filter(array_map('trim', explode(',', (string)secscan_config('trusted_proxies'))));
+
+    if ((string)secscan_config('trust_cloudflare') === '1') {
+        $ranges = array_merge($ranges, secscan_cloudflare_ranges());
+    }
+
+    foreach ($ranges as $range) {
+        if (secscan_ip_in_cidr($ip, $range)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * True if $ip falls within $range. $range may be a bare IP (exact match) or a
+ * CIDR block. Works for both IPv4 and IPv6 via binary prefix comparison.
+ */
+function secscan_ip_in_cidr(string $ip, string $range): bool
+{
+    $ip = trim($ip);
+    $range = trim($range);
+    if ($ip === '' || $range === '') {
+        return false;
+    }
+
+    if (!str_contains($range, '/')) {
+        return $ip === $range;
+    }
+
+    [$subnet, $maskLen] = explode('/', $range, 2);
+    $maskLen = (int)$maskLen;
+
+    $ipBin     = @inet_pton($ip);
+    $subnetBin = @inet_pton(trim($subnet));
+    if ($ipBin === false || $subnetBin === false) {
+        return false;
+    }
+    // Address families must match (4 bytes for v4, 16 for v6).
+    if (strlen($ipBin) !== strlen($subnetBin)) {
+        return false;
+    }
+
+    $maxBits = strlen($ipBin) * 8;
+    if ($maskLen < 0 || $maskLen > $maxBits) {
+        return false;
+    }
+
+    $fullBytes = intdiv($maskLen, 8);
+    $remBits   = $maskLen % 8;
+
+    if ($fullBytes > 0 && strncmp($ipBin, $subnetBin, $fullBytes) !== 0) {
+        return false;
+    }
+    if ($remBits === 0) {
+        return true;
+    }
+    $mask = chr((0xFF << (8 - $remBits)) & 0xFF);
+    return (ord($ipBin[$fullBytes]) & ord($mask)) === (ord($subnetBin[$fullBytes]) & ord($mask));
+}
+
+/**
+ * Cloudflare's published edge IP ranges. See https://www.cloudflare.com/ips/
+ * Used only when SECSCAN_TRUST_CLOUDFLARE=1.
+ */
+function secscan_cloudflare_ranges(): array
+{
+    return [
+        // IPv4
+        '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
+        '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20',
+        '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
+        '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
+        // IPv6
+        '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32',
+        '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32',
+    ];
+}
+
+/**
+ * Reliable HTTPS detection. Direct server signals (HTTPS, SERVER_PORT) are always
+ * trusted; spoofable forwarded scheme headers only when behind a trusted proxy.
+ */
+function secscan_is_https(): bool
+{
+    if (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off') {
+        return true;
+    }
+    if ((string)($_SERVER['SERVER_PORT'] ?? '') === '443') {
+        return true;
+    }
+    if (secscan_is_trusted_proxy(trim((string)($_SERVER['REMOTE_ADDR'] ?? '')))) {
+        if (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https') {
+            return true;
+        }
+        $cfVisitor = (string)($_SERVER['HTTP_CF_VISITOR'] ?? '');
+        if ($cfVisitor !== '' && str_contains($cfVisitor, 'https')) {
+            return true;
+        }
+    }
+    return false;
 }

@@ -1,15 +1,49 @@
-Options -Indexes
+Options -Indexes -MultiViews
+ServerSignature Off
 
-<FilesMatch "(\.bak|\.db|\.sqlite|\.sql|\.log|\.env|composer\.(json|lock)|README\.md)$">
+# ----------------------------------------------------------------
+# Block dotfiles (.env, .git, .htpasswd, .DS_Store, …) entirely.
+# Files served from /.well-known/ have ordinary basenames (e.g.
+# security.txt) so they remain publicly reachable.
+# ----------------------------------------------------------------
+<FilesMatch "^\.">
     Require all denied
 </FilesMatch>
 
-<FilesMatch "^(config\.php)$">
+# ----------------------------------------------------------------
+# Block secrets, databases, dumps, logs, backups and editor/OS noise.
+# Note: each alternative is matched anywhere in the name so timestamped
+# backups like "scanner.php.bak.20260612120212" are also caught.
+# ----------------------------------------------------------------
+<FilesMatch "(\.bak|\.backup|\.old|\.orig|\.swp|\.tmp|\.db|\.sqlite|\.sqlite3|\.sql|\.log|\.env|\.ini|\.lock)(\.|$)">
     Require all denied
 </FilesMatch>
 
+<FilesMatch "^(config\.php|composer\.(json|lock)|package(-lock)?\.json|README\.md|AGENTS\.md)$">
+    Require all denied
+</FilesMatch>
+
+# ----------------------------------------------------------------
+# Deny direct web access to non-public directories.
+# ----------------------------------------------------------------
 <IfModule mod_rewrite.c>
     RewriteEngine On
-    RewriteRule ^data/ - [F,L]
-    RewriteRule ^src/ - [F,L]
+    RewriteRule ^data/    - [F,L]
+    RewriteRule ^src/     - [F,L]
+    RewriteRule ^scripts/ - [F,L]
+    RewriteRule (^|/)\.git/ - [F,L]
+    # Block the HTTP TRACE method (cross-site tracing / XST).
+    RewriteCond %{REQUEST_METHOD} ^TRACE [NC]
+    RewriteRule .* - [F,L]
+</IfModule>
+
+# ----------------------------------------------------------------
+# Baseline security headers (defense in depth; PHP also sets these).
+# ----------------------------------------------------------------
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "DENY"
+    Header always set Referrer-Policy "strict-origin-when-cross-origin"
+    Header always unset X-Powered-By
+    Header always unset Server
 </IfModule>

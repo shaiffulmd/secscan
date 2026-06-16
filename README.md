@@ -25,6 +25,20 @@ Set these environment variables before deployment:
 - `SECSCAN_DATA_DIR`
 - `SECSCAN_DB_PATH`
 
+### Running behind a proxy or CDN
+
+Forwarded client-IP headers (`CF-Connecting-IP`, `X-Real-IP`, `X-Forwarded-For`)
+are spoofable, so SecScan ignores them by default and rate-limits on the direct
+connection IP (`REMOTE_ADDR`). If you run behind a reverse proxy, load balancer,
+or CDN, you **must** tell SecScan which proxies to trust or per-IP rate limiting
+and the dashboard's unique-IP counts will be wrong:
+
+- `SECSCAN_TRUSTED_PROXIES` — comma-separated proxy IPs / CIDR ranges (v4 or v6).
+- `SECSCAN_TRUST_CLOUDFLARE=1` — trust Cloudflare's published edge ranges.
+
+Without one of these set, all traffic behind a proxy appears to come from the
+proxy's IP and shares a single rate-limit bucket.
+
 Generate a dashboard password hash with:
 
 ```sh

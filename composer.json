@@ -5,11 +5,15 @@
   "require": {
     "php": ">=8.1",
     "ext-curl": "*",
+    "ext-json": "*",
+    "ext-mbstring": "*",
     "ext-openssl": "*",
     "ext-pdo": "*",
     "ext-pdo_sqlite": "*"
   },
   "scripts": {
-    "check": "php scripts/check.php"
+    "check": "php scripts/check.php",
+    "preflight": "php scripts/preflight.php",
+    "test:baseline": "php scripts/test_baseline.php"
   }
 }

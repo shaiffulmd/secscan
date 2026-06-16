@@ -54,9 +54,7 @@ $sendSecurityHeaders = static function (string $nonce): void {
     header('Cross-Origin-Embedder-Policy: require-corp');
     header('Cross-Origin-Resource-Policy: same-origin');
 
-    $isHttps = (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off')
-        || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https')
-        || (($_SERVER['HTTP_CF_VISITOR'] ?? '') && str_contains((string)$_SERVER['HTTP_CF_VISITOR'], 'https'));
+    $isHttps = secscan_is_https();
 
     if ($isHttps) {
         header('Strict-Transport-Security: max-age=31536000; includeSubDomains; preload');

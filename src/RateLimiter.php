@@ -2,10 +2,36 @@
 
 class RateLimiter
 {
+    /**
+     * Where rate-limit state lives. Prefer the app's private data dir (denied by
+     * data/.htaccess and ideally outside the web root) over the world-shared
+     * system temp dir, where on shared hosting another tenant could read or
+     * poison the predictably-named state files. Falls back to temp if the data
+     * dir is unavailable.
+     */
+    private static function storageDir(): string
+    {
+        if (function_exists('secscan_config')) {
+            $dataDir = (string)secscan_config('data_dir');
+            if ($dataDir !== '') {
+                $rlDir = $dataDir . '/ratelimit';
+                if (is_dir($rlDir) || @mkdir($rlDir, 0750, true) || is_dir($rlDir)) {
+                    if (is_writable($rlDir)) {
+                        return $rlDir;
+                    }
+                }
+                if (is_dir($dataDir) && is_writable($dataDir)) {
+                    return $dataDir;
+                }
+            }
+        }
+        return sys_get_temp_dir();
+    }
+
     public static function consume(string $bucket, string $key, int $limit, int $window): array
     {
         $safeBucket = preg_replace('/[^a-z0-9_.-]/i', '_', $bucket);
-        $file = sys_get_temp_dir() . "/secscan_ratelimit_{$safeBucket}.json";
+        $file = self::storageDir() . "/secscan_ratelimit_{$safeBucket}.json";
         $now = time();
 
         $fp = @fopen($file, 'c+');

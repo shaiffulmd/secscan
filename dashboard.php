@@ -24,9 +24,7 @@ if (!extension_loaded('pdo_sqlite')) {
 }
 
 session_name(SESSION_NAME);
-$isHttps = (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off')
-    || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https')
-    || (($_SERVER['HTTP_CF_VISITOR'] ?? '') && str_contains((string)$_SERVER['HTTP_CF_VISITOR'], 'https'));
+$isHttps = secscan_is_https();
 session_set_cookie_params([
     'lifetime' => 0,
     'path'     => '/',
@@ -90,9 +88,9 @@ header('X-Content-Type-Options: nosniff');
 header('X-Frame-Options: DENY');
 header('Referrer-Policy: no-referrer');
 header('Cache-Control: no-store, private, max-age=0');
-header("Content-Security-Policy: default-src 'self'; script-src 'nonce-{$nonce}'; style-src 'self' 'nonce-{$nonce}'; img-src 'self' data:; frame-ancestors 'none'");
+header("Content-Security-Policy: default-src 'self'; script-src 'nonce-{$nonce}'; style-src 'self' 'nonce-{$nonce}'; style-src-attr 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'");
 
-if (!empty($_SERVER['HTTPS'])) {
+if ($isHttps) {
     header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
 }
 
