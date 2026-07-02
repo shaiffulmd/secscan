@@ -2,6 +2,38 @@
 
 class UrlGuard
 {
+    private const BLOCKED_IP_RANGES = [
+        // IPv4 special-use ranges not consistently covered by PHP's filters.
+        '0.0.0.0/8',
+        '10.0.0.0/8',
+        '100.64.0.0/10',
+        '127.0.0.0/8',
+        '169.254.0.0/16',
+        '172.16.0.0/12',
+        '192.0.0.0/24',
+        '192.0.2.0/24',
+        '192.88.99.0/24',
+        '192.168.0.0/16',
+        '198.18.0.0/15',
+        '198.51.100.0/24',
+        '203.0.113.0/24',
+        '224.0.0.0/4',
+        '240.0.0.0/4',
+        '255.255.255.255/32',
+        // IPv6 loopback, link-local, unique-local, multicast, documentation, and transition ranges.
+        '::/128',
+        '::1/128',
+        '::ffff:0:0/96',
+        '64:ff9b::/96',
+        '100::/64',
+        '2001::/23',
+        '2001:db8::/32',
+        '2002::/16',
+        'fc00::/7',
+        'fe80::/10',
+        'ff00::/8',
+    ];
+
     public static function normalizeAndValidate(string $input): array
     {
         $url = trim($input);
@@ -113,6 +145,10 @@ class UrlGuard
             }
         }
 
+        if (empty($ipv4) && empty($ipv6)) {
+            return self::blockedResult('Domain tidak mempunyai rekod A/AAAA public. Scan tidak dibenarkan.');
+        }
+
         return [
             'allowed' => true,
             'error' => '',
@@ -123,7 +159,46 @@ class UrlGuard
 
     public static function isPublicIp(string $ip): bool
     {
-        return filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) !== false;
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+            return false;
+        }
+
+        foreach (self::BLOCKED_IP_RANGES as $range) {
+            if (self::ipInCidr($ip, $range)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static function ipInCidr(string $ip, string $range): bool
+    {
+        [$subnet, $maskLen] = explode('/', $range, 2);
+        $ipBin = @inet_pton($ip);
+        $subnetBin = @inet_pton($subnet);
+        if ($ipBin === false || $subnetBin === false || strlen($ipBin) !== strlen($subnetBin)) {
+            return false;
+        }
+
+        $maskLen = (int)$maskLen;
+        $maxBits = strlen($ipBin) * 8;
+        if ($maskLen < 0 || $maskLen > $maxBits) {
+            return false;
+        }
+
+        $fullBytes = intdiv($maskLen, 8);
+        $remainingBits = $maskLen % 8;
+
+        if ($fullBytes > 0 && strncmp($ipBin, $subnetBin, $fullBytes) !== 0) {
+            return false;
+        }
+        if ($remainingBits === 0) {
+            return true;
+        }
+
+        $mask = chr((0xFF << (8 - $remainingBits)) & 0xFF);
+        return (ord($ipBin[$fullBytes]) & ord($mask)) === (ord($subnetBin[$fullBytes]) & ord($mask));
     }
 
     private static function isBlockedHostname(string $host): bool

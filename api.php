@@ -70,6 +70,18 @@ require_once __DIR__ . '/scanner.php';
 
 try {
     $scanner = new SecurityScanner($target['url']);
+
+    // Authenticated scanning (opt-in via SECSCAN_ALLOW_AUTH_SCAN=1). Accepts a
+    // raw Cookie value and/or a header map so scans can run behind a login.
+    if (secscan_config('allow_auth_scan')) {
+        $authCookie  = trim((string)($input['auth_cookie'] ?? ''));
+        $authHeaders = $input['auth_headers'] ?? [];
+        if (!is_array($authHeaders)) $authHeaders = [];
+        if ($authCookie !== '' || $authHeaders !== []) {
+            $scanner->setAuth($authHeaders, $authCookie);
+        }
+    }
+
     $result = $scanner->scan();
 
     try {

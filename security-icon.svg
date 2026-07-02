@@ -1,20 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
   <title id="title">SecScan Security Icon</title>
   <desc id="desc">Shield and lock security icon for SecScan.</desc>
-  <defs>
-    <linearGradient id="shieldGlow" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#00ffcc"/>
-      <stop offset="1" stop-color="#38bdf8"/>
-    </linearGradient>
-    <linearGradient id="shieldStroke" x1="14" y1="10" x2="50" y2="54" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#9afce8"/>
-      <stop offset="1" stop-color="#00d4aa"/>
-    </linearGradient>
-  </defs>
-  <rect width="64" height="64" rx="16" fill="#07111d"/>
-  <path d="M32 7 14 14v14c0 11.2 7.2 21.65 18 24 10.8-2.35 18-12.8 18-24V14L32 7Z" fill="url(#shieldGlow)" fill-opacity="0.12" stroke="url(#shieldStroke)" stroke-width="3" stroke-linejoin="round"/>
-  <path d="M25.5 29.5v-3.25c0-3.65 2.93-6.75 6.5-6.75s6.5 3.1 6.5 6.75v3.25" fill="none" stroke="#d7fff7" stroke-width="3" stroke-linecap="round"/>
-  <rect x="22.5" y="29.5" width="19" height="15" rx="4" fill="#0c2134" stroke="#9afce8" stroke-width="2.5"/>
-  <circle cx="32" cy="36.5" r="2.3" fill="#00ffcc"/>
-  <path d="M32 38.8v2.9" stroke="#00ffcc" stroke-width="2.5" stroke-linecap="round"/>
+  <rect width="64" height="64" rx="16" fill="#262624"/>
+  <path d="M32 7 14 14v14c0 11.2 7.2 21.65 18 24 10.8-2.35 18-12.8 18-24V14L32 7Z" fill="#D97757" fill-opacity="0.14" stroke="#D97757" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M25.5 29.5v-3.25c0-3.65 2.93-6.75 6.5-6.75s6.5 3.1 6.5 6.75v3.25" fill="none" stroke="#F0EEE6" stroke-width="3" stroke-linecap="round"/>
+  <rect x="22.5" y="29.5" width="19" height="15" rx="4" fill="#31302E" stroke="#E8A288" stroke-width="2.5"/>
+  <circle cx="32" cy="36.5" r="2.3" fill="#D97757"/>
+  <path d="M32 38.8v2.9" stroke="#D97757" stroke-width="2.5" stroke-linecap="round"/>
 </svg>

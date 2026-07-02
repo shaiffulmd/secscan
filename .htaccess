@@ -1,5 +1,6 @@
 Options -Indexes -MultiViews
 ServerSignature Off
+DirectoryIndex index.php
 
 # ----------------------------------------------------------------
 # Block dotfiles (.env, .git, .htpasswd, .DS_Store, …) entirely.
@@ -46,4 +47,11 @@ ServerSignature Off
     Header always set Referrer-Policy "strict-origin-when-cross-origin"
     Header always unset X-Powered-By
     Header always unset Server
+</IfModule>
+
+# Static assets are versioned from index.php using filemtime query strings.
+<IfModule mod_headers.c>
+    <FilesMatch "\.(css|js|svg)$">
+        Header always set Cache-Control "public, max-age=604800, immutable"
+    </FilesMatch>
 </IfModule>

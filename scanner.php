@@ -12,8 +12,9 @@ class SecurityFinding
     public string $recommendation;
     /** @var string[] Documentation/standard references (OWASP, MDN, RFC, …). */
     public array $references;
+    public bool $scoreable;
 
-    public function __construct(string $category, string $check, string $severity, string $message, string $recommendation = '', array $references = [])
+    public function __construct(string $category, string $check, string $severity, string $message, string $recommendation = '', array $references = [], bool $scoreable = true)
     {
         $this->category = $category;
         $this->check = $check;
@@ -21,6 +22,7 @@ class SecurityFinding
         $this->message = $message;
         $this->recommendation = $recommendation;
         $this->references = $references;
+        $this->scoreable = $scoreable;
     }
 }
 
@@ -51,6 +53,27 @@ class SecurityScanner
     private string $negotiatedCipherName = '';
     private int $negotiatedCipherBits = 0;
     private string $negotiatedCipherVersion = '';
+
+    // Set by checkCMSDetection() and consumed by checkCMSVulnerabilities()
+    // to look up published CVEs for the detected platform.
+    private string $detectedCms = '';
+    private string $detectedCmsVersion = '';
+    private array $detectedCmsSignals = [];
+
+    // Installed WordPress plugins fingerprinted from the target:
+    //   slug => ['version' => ?string, 'confirmed' => bool]
+    private array $installedPlugins = [];
+
+    // Installed Joomla extensions fingerprinted from front-end asset paths:
+    //   slug (e.g. "com_sppagebuilder") => normalised token used for matching
+    private array $installedExtensions = [];
+
+    // Optional authenticated-scan credentials, applied ONLY to same-host target
+    // requests (never across a redirect to a different host) so session tokens
+    // cannot leak cross-origin. Populated via setAuth(); empty by default.
+    private array $authHeaders = [];   // ['Authorization: Bearer …', 'X-Api-Key: …']
+    private string $authCookie = '';    // raw Cookie header value, e.g. 'sid=abc; csrf=xyz'
+    private bool $authEnabled = false;
 
     private const WEAK_CIPHERS = [
         'RC4', 'DES-CBC', '3DES', 'DES-CBC3', 'NULL',
@@ -84,13 +107,91 @@ class SecurityScanner
         }
     }
 
-    private function addFinding(string $category, string $check, string $severity, string $message, string $recommendation = '', array $references = []): void
+    private function addFinding(string $category, string $check, string $severity, string $message, string $recommendation = '', array $references = [], bool $scoreable = true): void
     {
         // Auto-attach standard references when the caller didn't supply any.
         if (empty($references)) {
             $references = $this->referencesFor($category, $check);
         }
-        $this->findings[] = new SecurityFinding($category, $check, $severity, $message, $recommendation, $references);
+        $this->findings[] = new SecurityFinding($category, $check, $severity, $message, $recommendation, $references, $scoreable);
+    }
+
+    /**
+     * Supply credentials so checks can scan behind a login (authenticated scan).
+     *
+     * $headers accepts either a list of "Name: value" strings or a name=>value
+     * map. Only a safe subset is honoured (Authorization, Cookie, and any X-*
+     * header); everything else is dropped. CR/LF is stripped to prevent header
+     * injection. Any 'Cookie' header is merged into the cookie jar. These
+     * credentials are sent ONLY to the original target host — see withAuth()
+     * and the same-host guard in fetchUrl() — so tokens never leak on a
+     * cross-host redirect.
+     *
+     * @param array<int|string,string> $headers
+     */
+    public function setAuth(array $headers = [], string $cookie = ''): void
+    {
+        $safe        = [];
+        $cookieParts = [];
+        $rawCookie   = trim($cookie);
+        if ($rawCookie !== '') $cookieParts[] = $rawCookie;
+
+        foreach ($headers as $k => $v) {
+            if (is_int($k)) {
+                $line = trim((string)$v);
+                if ($line === '' || strpos($line, ':') === false) continue;
+                [$name, $val] = explode(':', $line, 2);
+            } else {
+                $name = (string)$k;
+                $val  = (string)$v;
+            }
+            $name = preg_replace('/[\r\n]/', '', trim($name));
+            $val  = preg_replace('/[\r\n]/', '', trim($val));
+            if ($name === '' || $val === '') continue;
+            if (!$this->isAllowedAuthHeader($name)) continue;
+
+            if (strcasecmp($name, 'Cookie') === 0) {
+                $cookieParts[] = $val;
+                continue;
+            }
+            $safe[] = "{$name}: {$val}";
+        }
+
+        $this->authHeaders = $safe;
+        $this->authCookie  = implode('; ', $cookieParts);
+        $this->authEnabled = !empty($this->authHeaders) || $this->authCookie !== '';
+    }
+
+    /** Allow-list of request headers that are meaningful for an authenticated scan. */
+    private function isAllowedAuthHeader(string $name): bool
+    {
+        $n = strtolower($name);
+        if ($n === 'authorization' || $n === 'cookie') return true;
+        return str_starts_with($n, 'x-'); // API keys, CSRF tokens, tenant IDs, …
+    }
+
+    public function isAuthenticated(): bool
+    {
+        return $this->authEnabled;
+    }
+
+    /**
+     * Merge authenticated-scan credentials into a cURL option array. Callers
+     * wrap their per-request option array with this so every same-host target
+     * request carries the session. Preserves any CURLOPT_HTTPHEADER the caller
+     * already set (e.g. Origin/Content-Type probes).
+     */
+    private function withAuth(array $opts): array
+    {
+        if (!$this->authEnabled) return $opts;
+        if ($this->authCookie !== '') {
+            $opts[CURLOPT_COOKIE] = $this->authCookie;
+        }
+        if (!empty($this->authHeaders)) {
+            $existing = $opts[CURLOPT_HTTPHEADER] ?? [];
+            $opts[CURLOPT_HTTPHEADER] = array_merge($existing, $this->authHeaders);
+        }
+        return $opts;
     }
 
     /**
@@ -162,16 +263,63 @@ class SecurityScanner
      */
     private function pinResolve(): array
     {
-        $ips = $this->pinnedIps();
-        if (!$ips || filter_var($this->hostname, FILTER_VALIDATE_IP)) {
+        return $this->pinResolveForHost(
+            $this->hostname,
+            $this->port,
+            $this->resolvedIpv4,
+            $this->resolvedIpv6,
+            [80, 443]
+        );
+    }
+
+    private function pinResolveForHost(string $host, int $port, array $ipv4, array $ipv6, array $extraPorts = []): array
+    {
+        $host = trim($host, '[]');
+        if ($host === '' || filter_var($host, FILTER_VALIDATE_IP)) {
             return [];
         }
+
+        $ips = [];
+        foreach (array_merge($ipv4, $ipv6) as $ip) {
+            if (is_string($ip) && UrlGuard::isPublicIp($ip)) {
+                $ips[] = $ip;
+            }
+        }
+        $ips = array_values(array_unique($ips));
+        if (!$ips) {
+            return [];
+        }
+
         $joined = implode(',', $ips);
-        $out    = [];
-        foreach (array_unique([80, 443, $this->port]) as $p) {
-            $out[] = "{$this->hostname}:{$p}:{$joined}";
+        $out = [];
+        foreach (array_unique(array_map('intval', array_merge([$port], $extraPorts))) as $p) {
+            if ($p > 0 && $p <= 65535) {
+                $out[] = "{$host}:{$p}:{$joined}";
+            }
         }
         return $out;
+    }
+
+    private function portForUrl(string $url, string $scheme): int
+    {
+        $port = parse_url($url, PHP_URL_PORT);
+        if (is_int($port) && $port > 0 && $port <= 65535) {
+            return $port;
+        }
+        return strtolower($scheme) === 'https' ? 443 : 80;
+    }
+
+    private function applyValidatedTarget(string $url, array $target): void
+    {
+        $this->url = rtrim($url, '/');
+        $this->scheme = (string)($target['scheme'] ?? $this->scheme);
+        $this->hostname = (string)($target['hostname'] ?? $this->hostname);
+        $this->port = $this->portForUrl($url, $this->scheme);
+        $this->resolvedIpv4 = array_values(array_unique($target['ipv4'] ?? []));
+        $this->resolvedIpv6 = array_values(array_unique($target['ipv6'] ?? []));
+        $this->pinnedIps = null;
+        $this->dnsCache = [];
+        $this->baselineProbe = ['done' => false, 'catchall' => false, 'samples' => []];
     }
 
     /**
@@ -233,10 +381,15 @@ class SecurityScanner
             'checkECDHESupport', 'checkPerfectForwardSecrecy', 'checkCertificateChain',
             'checkCORS', 'checkCORSReflection', 'checkCrossDomainPolicy',
             'checkMixedContent', 'checkSRI', 'checkInsecureForms', 'checkMetaCSP',
+            'checkCsrfProtection',
+            'checkExposedSecrets',
             'checkHTTPVersions',
             'checkDNSSecurity',
+            'checkEmailAuthHardening',
             'checkZoneTransfer',
+            'checkApiGraphQL',
             'checkCMSDetection',
+            'checkCMSVulnerabilities',
             'checkWAF',
             'checkOutdatedSoftware',
             'checkSubdomainTakeover',
@@ -265,6 +418,9 @@ class SecurityScanner
                     str_contains($method, 'CMS') || str_contains($method, 'Tech') || str_contains($method, 'Software') || str_contains($method, 'WAF') => 'Technology',
                     str_contains($method, 'Subdomain') => 'DNS',
                     str_contains($method, 'Method') => 'Headers',
+                    str_contains($method, 'Secret') => 'Information Leakage',
+                    str_contains($method, 'Csrf') => 'HTML',
+                    str_contains($method, 'Email') || str_contains($method, 'GraphQL') => str_contains($method, 'GraphQL') ? 'API' : 'DNS',
                     str_contains($method, 'File') || str_contains($method, 'Admin') => 'Exposed Files',
                     str_contains($method, 'Robots') || str_contains($method, 'Security') => 'Security',
                     str_contains($method, 'CAA') || str_contains($method, 'MTA') || str_contains($method, 'BIMI') => 'DNS',
@@ -290,23 +446,32 @@ class SecurityScanner
         $maxRedirects = 5;
 
         for ($redirects = 0; $redirects <= $maxRedirects; $redirects++) {
-            if (!UrlGuard::isPublicUrl($currentUrl)) {
+            $target = UrlGuard::normalizeAndValidate($currentUrl);
+            if (!($target['ok'] ?? false)) {
                 $this->addFinding(
                     'Connection',
                     'Redirect Safety',
                     'critical',
-                    'Refused to follow a redirect to a private, reserved, or local network target.',
+                    'Refused to follow an unsafe redirect target: ' . ($target['error'] ?? 'invalid URL') . '.',
                     'Ensure redirects only point to public http/https URLs.'
                 );
                 return false;
             }
 
+            $currentUrl = (string)$target['url'];
+            $currentPort = $this->portForUrl($currentUrl, (string)$target['scheme']);
             $ch = curl_init();
             $headers = [];
 
-            curl_setopt_array($ch, [
+            $opts = [
                 CURLOPT_URL            => $currentUrl,
-                CURLOPT_RESOLVE        => $this->pinResolve(),
+                CURLOPT_RESOLVE        => $this->pinResolveForHost(
+                    (string)$target['hostname'],
+                    $currentPort,
+                    $target['ipv4'] ?? [],
+                    $target['ipv6'] ?? [],
+                    [80, 443]
+                ),
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_FOLLOWLOCATION => false,
                 CURLOPT_TIMEOUT        => 20,
@@ -328,7 +493,15 @@ class SecurityScanner
                     }
                     return $len;
                 },
-            ]);
+            ];
+
+            // Only attach authenticated-scan credentials when the current hop is
+            // still the original target host — never leak them across a redirect
+            // to a different host.
+            if (strcasecmp((string)($target['hostname'] ?? ''), $this->hostname) === 0) {
+                $opts = $this->withAuth($opts);
+            }
+            curl_setopt_array($ch, $opts);
 
             $body           = curl_exec($ch);
             $this->httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -370,7 +543,7 @@ class SecurityScanner
                 continue;
             }
 
-            $this->url = $currentUrl;
+            $this->applyValidatedTarget($currentUrl, $target);
             $this->responseHeaders = $headers;
             $this->responseBody    = (string)$body;
             $this->addFinding('Connection', 'Reachability', 'pass', "Successfully connected — HTTP {$this->httpCode}.");
@@ -470,7 +643,25 @@ class SecurityScanner
         }
 
         $issues = [];
-        if (strpos($csp, "'unsafe-inline'") !== false) $issues[] = "allows 'unsafe-inline' (XSS risk)";
+
+        // A nonce, hash, or 'strict-dynamic' source causes CSP2+ browsers to
+        // IGNORE 'unsafe-inline' for scripts — it only remains as a fallback for
+        // ancient browsers. Flagging it in that case is a false positive, so we
+        // only warn about 'unsafe-inline' when nothing neutralises it.
+        $hasNonceOrHash = (bool) preg_match("/'(nonce-[^']+|sha(?:256|384|512)-[^']+)'/i", $csp);
+        $hasStrictDynamic = strpos($csp, "'strict-dynamic'") !== false;
+        if (strpos($csp, "'unsafe-inline'") !== false) {
+            if ($hasNonceOrHash || $hasStrictDynamic) {
+                // Neutralised — note it as advisory rather than a scored issue.
+                $this->addFinding('Headers', 'CSP unsafe-inline Fallback', 'info',
+                    "CSP lists 'unsafe-inline' but a " . ($hasStrictDynamic ? "'strict-dynamic'" : 'nonce/hash') .
+                    " source is present, so modern browsers ignore 'unsafe-inline'. It only affects legacy browsers.",
+                    "Optional: drop 'unsafe-inline' once you no longer support pre-CSP2 browsers.",
+                    [], false);
+            } else {
+                $issues[] = "allows 'unsafe-inline' (XSS risk)";
+            }
+        }
         if (strpos($csp, "'unsafe-eval'") !== false)   $issues[] = "allows 'unsafe-eval' (code injection risk)";
         if (strpos($csp, 'default-src') === false)     $issues[] = 'missing default-src fallback directive';
         if (preg_match('/(?:^|[\s;])\*(?:$|[\s;])/', $csp)) $issues[] = 'contains wildcard (*) source';
@@ -1257,6 +1448,154 @@ class SecurityScanner
     }
 
     // ================================================================
+    //  EXPOSED SECRETS (credentials/keys leaked in the response body)
+    // ================================================================
+
+    /**
+     * Scan an arbitrary text blob for high-confidence secret formats.
+     *
+     * Pure and side-effect free so it can be unit-tested offline. Only
+     * well-known, structured token formats are matched to keep the false-
+     * positive rate low. Returns a de-duplicated list of:
+     *   ['type' => string, 'severity' => 'critical'|'warning', 'sample' => masked]
+     *
+     * @return array<int, array{type:string, severity:string, sample:string}>
+     */
+    public function scanBodyForSecrets(string $body): array
+    {
+        if ($body === '') return [];
+        // Cap work on very large bodies; secrets near the top matter most.
+        $body = substr($body, 0, 500000);
+
+        // type => [regex, severity]. High-confidence structured formats only.
+        $patterns = [
+            'AWS Access Key ID'      => ['/\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA)[0-9A-Z]{16}\b/',           'critical'],
+            'AWS Secret Access Key'  => ['/\baws_secret_access_key\s*[:=]\s*["\']?[A-Za-z0-9\/+]{40}["\']?/i',  'critical'],
+            'Google API Key'         => ['/\bAIza[0-9A-Za-z\-_]{35}\b/',                                        'critical'],
+            'Stripe Secret Key'      => ['/\b(?:sk|rk)_live_[0-9a-zA-Z]{16,}\b/',                               'critical'],
+            'GitHub Token'           => ['/\bgh[pousr]_[0-9A-Za-z]{36,}\b/',                                    'critical'],
+            'Slack Token'            => ['/\bxox[baprs]-[0-9A-Za-z-]{10,}\b/',                                  'critical'],
+            'Slack Webhook'          => ['#https://hooks\.slack\.com/services/[A-Za-z0-9/]+#',                  'critical'],
+            'SendGrid API Key'       => ['/\bSG\.[\w-]{20,}\.[\w-]{30,}\b/',                                    'critical'],
+            'Mailgun API Key'        => ['/\bkey-[0-9a-zA-Z]{32}\b/',                                           'critical'],
+            'Twilio API Key'         => ['/\bSK[0-9a-fA-F]{32}\b/',                                             'critical'],
+            'npm Token'              => ['/\bnpm_[0-9A-Za-z]{36}\b/',                                           'critical'],
+            'Private Key Block'      => ['/-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----/',       'critical'],
+            'JSON Web Token (JWT)'   => ['/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/',   'warning'],
+        ];
+
+        $found = [];
+        $seen  = [];
+        foreach ($patterns as $type => [$regex, $severity]) {
+            if (preg_match($regex, $body, $m)) {
+                $key = $type;
+                if (isset($seen[$key])) continue;
+                $seen[$key] = true;
+                $found[] = [
+                    'type'     => $type,
+                    'severity' => $severity,
+                    'sample'   => $this->maskSecret($m[0]),
+                ];
+            }
+        }
+        return $found;
+    }
+
+    /** Redact the middle of a secret so the report never echoes it in full. */
+    private function maskSecret(string $s): string
+    {
+        $s = trim($s);
+        if (strlen($s) <= 12) return substr($s, 0, 3) . '…';
+        return substr($s, 0, 6) . '…' . substr($s, -4);
+    }
+
+    private function checkExposedSecrets(): void
+    {
+        $hits = $this->scanBodyForSecrets($this->responseBody);
+        if (empty($hits)) {
+            $this->addFinding('Information Leakage', 'Exposed Secrets', 'pass',
+                'No credentials, API keys, or private keys detected in the page source.');
+            return;
+        }
+        foreach ($hits as $h) {
+            $this->addFinding(
+                'Information Leakage',
+                'Exposed Secret: ' . $h['type'],
+                $h['severity'],
+                "Possible {$h['type']} exposed in the response body (redacted: {$h['sample']}).",
+                'Remove the secret from client-delivered source, rotate/revoke it immediately, and move it to a server-side secret store.',
+                ['https://owasp.org/www-community/vulnerabilities/Information_exposure_through_query_strings_in_url',
+                 'https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html']
+            );
+        }
+    }
+
+    // ================================================================
+    //  CSRF PROTECTION (state-changing forms lacking anti-CSRF tokens)
+    // ================================================================
+
+    /**
+     * Inspect HTML for POST forms that carry no anti-CSRF token field.
+     *
+     * Pure/offline for unit testing. A page-level CSRF <meta> tag (Rails/Laravel
+     * style, consumed by JS) counts as protection for all forms. Returns:
+     *   ['post_forms' => int, 'unprotected' => int]
+     *
+     * @return array{post_forms:int, unprotected:int}
+     */
+    public function analyzeFormsForCsrf(string $html): array
+    {
+        if ($html === '') return ['post_forms' => 0, 'unprotected' => 0];
+        $html = substr($html, 0, 300000);
+
+        // Framework meta-token (e.g. <meta name="csrf-token" ...>) protects
+        // AJAX/form submissions app-wide, so treat its presence as coverage.
+        $hasMetaToken = (bool) preg_match(
+            '/<meta[^>]+name\s*=\s*["\'](?:csrf-token|_csrf|xsrf-token|csrf-param)["\'][^>]*>/i',
+            $html
+        );
+
+        preg_match_all('/<form\b[^>]*>(.*?)<\/form>/is', $html, $forms, PREG_SET_ORDER);
+        $postForms = 0;
+        $unprotected = 0;
+        $tokenNameRe = '/name\s*=\s*["\'][^"\']*(?:csrf|xsrf|_token|authenticity_token|nonce|requestverification)[^"\']*["\']/i';
+
+        foreach ($forms as $f) {
+            $tag   = $f[0];
+            $inner = $f[1] ?? '';
+            // Only POST (state-changing) forms are relevant.
+            if (!preg_match('/\bmethod\s*=\s*["\']?post["\']?/i', $tag)) continue;
+            $postForms++;
+            if ($hasMetaToken) continue;
+            if (preg_match($tokenNameRe, $inner)) continue;      // hidden token field
+            $unprotected++;
+        }
+        return ['post_forms' => $postForms, 'unprotected' => $unprotected];
+    }
+
+    private function checkCsrfProtection(): void
+    {
+        if (!$this->isHTML()) return;
+        $r = $this->analyzeFormsForCsrf($this->responseBody);
+
+        if ($r['post_forms'] === 0) {
+            $this->addFinding('HTML', 'CSRF Token', 'info',
+                'No POST forms found on the scanned page to assess for CSRF protection.',
+                '', [], false);
+            return;
+        }
+        if ($r['unprotected'] > 0) {
+            $this->addFinding('HTML', 'CSRF Token', 'warning',
+                "{$r['unprotected']} of {$r['post_forms']} POST form(s) have no visible anti-CSRF token field or page-level CSRF meta tag.",
+                'Add a per-session anti-CSRF token (hidden field or framework meta tag) to state-changing forms, and set SameSite on session cookies.',
+                ['https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html']);
+        } else {
+            $this->addFinding('HTML', 'CSRF Token', 'pass',
+                "All {$r['post_forms']} POST form(s) carry an anti-CSRF token or the page exposes a CSRF meta tag.");
+        }
+    }
+
+    // ================================================================
     //  8. HTTP/2 & HTTP/3
     // ================================================================
 
@@ -1460,24 +1799,111 @@ class SecurityScanner
 
     private function checkCMSDetection(): void
     {
-        $body  = $this->responseBody;
-        $lower = strtolower(substr($body, 0, 200000));
-        $cms   = null;
+        $bodySample = str_replace('\\/', '/', substr($this->responseBody, 0, 300000));
+        $lower      = strtolower($bodySample);
+        $headerHints = strtolower(implode(' ', array_filter(array_merge(
+            $this->getAllHeaders('link'),
+            $this->getAllHeaders('x-generator'),
+            $this->getAllHeaders('x-drupal-cache'),
+            $this->getAllHeaders('x-pingback')
+        ))));
 
-        if (strpos($lower, '/wp-content/') !== false || strpos($lower, '/wp-includes/') !== false) {
-            $cms = 'WordPress';
-            if (preg_match('/<meta[^>]+generator[^>]+WordPress\s*([\d.]+)/i', $body, $m)) $cms .= ' ' . $m[1];
-        } elseif (strpos($lower, '/components/com_') !== false || strpos($lower, 'joomla') !== false) {
-            $cms = 'Joomla';
-        } elseif (strpos($lower, 'drupal') !== false || stripos($this->getHeader('x-generator') ?? '', 'Drupal') !== false) {
-            $cms = 'Drupal';
-        } elseif (strpos($lower, 'cdn.shopify.com') !== false) { $cms = 'Shopify'; }
-        elseif (strpos($lower, 'wix.com') !== false)           { $cms = 'Wix'; }
-        elseif (strpos($lower, 'squarespace') !== false)       { $cms = 'Squarespace'; }
-        elseif (strpos($lower, 'ghost-') !== false)            { $cms = 'Ghost'; }
+        $generator = '';
+        if (preg_match_all('/<meta\b[^>]*>/i', $bodySample, $metaTags)) {
+            foreach ($metaTags[0] as $tag) {
+                if (preg_match('/\bname\s*=\s*["\']generator["\']/i', $tag)
+                    && preg_match('/\bcontent\s*=\s*["\']([^"\']+)/i', $tag, $gm)) {
+                    $generator = html_entity_decode(trim($gm[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                    break;
+                }
+            }
+        }
 
-        if ($cms) $this->addFinding('Technology', 'CMS Detected', 'info', "CMS: {$cms}.", 'Keep CMS, themes, and plugins updated.');
-        else $this->addFinding('Technology', 'CMS Detection', 'pass', 'No common CMS fingerprint detected.');
+        $candidates = [];
+        $addSignal = static function (string $name, string $signal, string $version = '') use (&$candidates): void {
+            if (!isset($candidates[$name])) {
+                $candidates[$name] = ['signals' => [], 'version' => ''];
+            }
+            $candidates[$name]['signals'][$signal] = true;
+            if ($version !== '' && $candidates[$name]['version'] === '') {
+                $candidates[$name]['version'] = $version;
+            }
+        };
+
+        if (str_contains($lower, 'wp-content/') || str_contains($lower, 'wp-includes/')) {
+            $addSignal('WordPress', 'WordPress asset paths');
+        }
+        if (str_contains($lower, 'wp-json') || str_contains($headerHints, 'api.w.org')) {
+            $addSignal('WordPress', 'WordPress REST API link');
+        }
+        if (str_contains($lower, 'wp-emoji-release') || str_contains($lower, 'wp-block-library')) {
+            $addSignal('WordPress', 'WordPress core frontend assets');
+        }
+        if (stripos($generator, 'WordPress') !== false) {
+            $version = preg_match('/WordPress\s*([0-9][0-9A-Za-z.\-]*)/i', $generator, $m) ? $m[1] : '';
+            $addSignal('WordPress', 'generator meta tag', $version);
+        }
+        if (str_contains($headerHints, 'wordpress')) {
+            $addSignal('WordPress', 'HTTP generator/pingback header');
+        }
+
+        if (str_contains($lower, '/components/com_') || str_contains($lower, 'option=com_')) {
+            $addSignal('Joomla', 'Joomla component paths');
+        }
+        if (str_contains($lower, '/media/system/') || str_contains($lower, '/templates/system/')) {
+            $addSignal('Joomla', 'Joomla system assets');
+        }
+        if (stripos($generator, 'Joomla') !== false || str_contains($lower, 'joomla')) {
+            $version = preg_match('/Joomla!?\s*([0-9][0-9A-Za-z.\-]*)/i', $generator, $m) ? $m[1] : '';
+            $addSignal('Joomla', $generator !== '' ? 'generator meta tag' : 'Joomla keyword', $version);
+        }
+
+        if (str_contains($lower, 'drupal-settings-json') || str_contains($lower, '/core/misc/drupal')) {
+            $addSignal('Drupal', 'Drupal frontend assets');
+        }
+        if (str_contains($lower, '/sites/default/files') || str_contains($lower, '/sites/all/')) {
+            $addSignal('Drupal', 'Drupal site file paths');
+        }
+        if (stripos($generator, 'Drupal') !== false || str_contains($headerHints, 'drupal')) {
+            $version = preg_match('/Drupal\s*([0-9][0-9A-Za-z.\-]*)/i', $generator, $m) ? $m[1] : '';
+            $addSignal('Drupal', $generator !== '' ? 'generator meta/header' : 'HTTP generator header', $version);
+        }
+
+        if (str_contains($lower, 'cdn.shopify.com') || str_contains($lower, 'shopify-section')) {
+            $addSignal('Shopify', 'Shopify storefront assets');
+        }
+        if (str_contains($lower, 'wix.com') || str_contains($lower, 'wixstatic.com')) {
+            $addSignal('Wix', 'Wix assets');
+        }
+        if (str_contains($lower, 'squarespace') || str_contains($lower, 'static1.squarespace.com')) {
+            $addSignal('Squarespace', 'Squarespace assets');
+        }
+        if (str_contains($lower, 'ghost-') || str_contains($lower, 'ghost/api/')) {
+            $addSignal('Ghost', 'Ghost assets/API');
+        }
+
+        if ($candidates) {
+            uasort($candidates, static fn($a, $b) => count($b['signals']) <=> count($a['signals']));
+            $cms = (string)array_key_first($candidates);
+            $version = (string)($candidates[$cms]['version'] ?? '');
+            $signals = array_keys($candidates[$cms]['signals']);
+
+            $this->detectedCms = $cms;
+            $this->detectedCmsVersion = $version;
+            $this->detectedCmsSignals = $signals;
+
+            $display = $cms . ($version !== '' ? " {$version}" : '');
+            $detail = implode(', ', array_slice($signals, 0, 3));
+            $this->addFinding(
+                'Technology',
+                'CMS Detected',
+                'info',
+                "CMS: {$display}. Signals: {$detail}.",
+                'Keep CMS, themes, and plugins updated.'
+            );
+        } else {
+            $this->addFinding('Technology', 'CMS Detection', 'pass', 'No common CMS fingerprint detected.');
+        }
 
         $server = $this->getHeader('server') ?? '';
         if (preg_match('/nginx\/([\d.]+)/i', $server, $m)) $this->addFinding('Technology', 'Server Version', 'warning', "Nginx version: {$m[1]}.", 'Add "server_tokens off;" in nginx.conf.');
@@ -1492,7 +1918,7 @@ class SecurityScanner
         if (strpos($lower, 'laravel') !== false || $this->cookieNameExists('laravel_session') || $this->cookieNameExists('XSRF-TOKEN')) $frameworks[] = 'Laravel';
         if (strpos($lower, '_next/static') !== false) $frameworks[] = 'Next.js';
         if (strpos($lower, '__nuxt') !== false)       $frameworks[] = 'Nuxt.js';
-        if (preg_match('/ng-version=["\'][\d.]+/i', $body)) $frameworks[] = 'Angular';
+        if (preg_match('/ng-version=["\'][\d.]+/i', $bodySample)) $frameworks[] = 'Angular';
         if (strpos($lower, 'django') !== false || $this->cookieNameExists('csrftoken')) $frameworks[] = 'Django';
         if ($frameworks) $this->addFinding('Technology', 'Framework', 'info', 'Detected: ' . implode(', ', $frameworks) . '.', 'Keep frameworks and dependencies updated.');
 
@@ -1508,6 +1934,528 @@ class SecurityScanner
     {
         foreach ($this->cookies as $c) { if (stripos(explode(';', $c)[0], $name . '=') !== false) return true; }
         return false;
+    }
+
+    // ================================================================
+    //  10b. CMS CVE LOOKUP (NVD)
+    // ================================================================
+
+    /**
+     * When checkCMSDetection() fingerprints a known CMS, query the NIST NVD
+     * 2.0 API for recently-published CVEs that mention that platform (core,
+     * plus the much larger universe of plugin/extension CVEs). Results are
+     * sorted newest-first and surfaced as findings, with CVSS base severity
+     * mapped onto SecScan's severity vocabulary.
+     *
+     * Notes:
+     *  - Only runs for CMSes with strong NVD keyword coverage.
+     *  - One outbound request per scan; set SECSCAN_NVD_API_KEY to raise the
+     *    NVD rate limit (5 req/30s anonymous -> 50 req/30s with a key).
+     *  - "terkini" window defaults to the last 120 days; override with
+     *    SECSCAN_CVE_WINDOW_DAYS.
+     */
+    private function checkCMSVulnerabilities(): void
+    {
+        $cms = $this->detectedCms;
+        if ($cms === '') return;
+
+        $supported = ['WordPress', 'Joomla', 'Drupal'];
+        if (!in_array($cms, $supported, true)) return;
+
+        // Fingerprint actually-installed plugins so CVEs can be confirmed
+        // against this site rather than just listed generically.
+        if ($cms === 'WordPress') $this->detectInstalledPlugins();
+        if ($cms === 'Joomla')    $this->detectJoomlaExtensions();
+
+        $windowDays = (int)(getenv('SECSCAN_CVE_WINDOW_DAYS') ?: 120);
+        if ($windowDays < 1 || $windowDays > 120) $windowDays = 120;
+
+        $end   = new DateTimeImmutable('now', new DateTimeZone('UTC'));
+        $start = $end->sub(new DateInterval("P{$windowDays}D"));
+        $fmt   = 'Y-m-d\TH:i:s.000';
+
+        $params = http_build_query([
+            'keywordSearch' => strtolower($cms),
+            'pubStartDate'  => $start->format($fmt),
+            'pubEndDate'    => $end->format($fmt),
+            'resultsPerPage'=> 40,
+        ]);
+        $apiUrl = 'https://services.nvd.nist.gov/rest/json/cves/2.0?' . $params;
+
+        $cacheTtl = (int)(getenv('SECSCAN_CVE_CACHE_TTL') ?: 86400);
+        if ($cacheTtl < 300) {
+            $cacheTtl = 300;
+        }
+        $json = $this->fetchCveFeed($apiUrl, $this->cveCachePath($cms, $windowDays), $cacheTtl);
+        if ($json === null) {
+            $this->addFinding('Technology', 'CMS CVE Lookup', 'info',
+                "Could not reach the NVD CVE feed for {$cms}.",
+                'Retry later, or check outbound HTTPS to services.nvd.nist.gov.',
+                [],
+                false);
+            return;
+        }
+
+        $data = json_decode($json, true);
+        $items = $data['vulnerabilities'] ?? null;
+        if (!is_array($items)) {
+            $this->addFinding('Technology', 'CMS CVE Lookup', 'info',
+                "NVD returned no parseable data for {$cms}.",
+                '',
+                [],
+                false);
+            return;
+        }
+
+        if (count($items) === 0) {
+            $this->addFinding('Technology', 'CMS CVEs', 'pass',
+                "No {$cms}-related CVEs published in the last {$windowDays} days.",
+                'Still keep core, themes/templates, and plugins/extensions updated.');
+            return;
+        }
+
+        // Normalise + sort newest-first.
+        $cves = [];
+        foreach ($items as $entry) {
+            $c = $entry['cve'] ?? null;
+            if (!is_array($c) || empty($c['id'])) continue;
+            $score = $this->cvssFrom($c['metrics'] ?? []);
+            $desc  = '';
+            foreach (($c['descriptions'] ?? []) as $d) {
+                if (($d['lang'] ?? '') === 'en') { $desc = $d['value']; break; }
+            }
+            // Confirm against the fingerprinted install base for this CMS.
+            $slug = ''; $installed = false;
+            if ($cms === 'WordPress') {
+                $slug      = $this->cvePluginSlug($c);
+                $installed = ($slug !== '' && isset($this->installedPlugins[$slug]));
+            } elseif ($cms === 'Joomla') {
+                $slug      = $this->matchJoomlaExtension($c);
+                $installed = ($slug !== '');
+            }
+            $cves[] = [
+                'id'        => $c['id'],
+                'published' => $c['published'] ?? '',
+                'score'     => $score['score'],
+                'sev'       => $score['severity'],
+                'desc'      => $desc,
+                'slug'      => $slug,
+                'installed' => $installed,
+            ];
+        }
+        // Confirmed-installed CVEs float to the top, then newest-first.
+        usort($cves, function ($a, $b) {
+            if ($a['installed'] !== $b['installed']) return $a['installed'] ? -1 : 1;
+            return strcmp($b['published'], $a['published']);
+        });
+
+        $total    = count($cves);
+        $critHigh = array_filter($cves, fn($v) => in_array($v['sev'], ['CRITICAL', 'HIGH'], true));
+
+        // Summary finding: generic ecosystem CVEs are intelligence only. They
+        // should not lower a site's grade unless this scan fingerprinted the
+        // affected plugin/extension as installed.
+        $matched = array_values(array_filter($cves, fn($v) => $v['installed']));
+        $worst = 'info';
+        foreach ($matched as $v) {
+            $mapped = $this->mapCveSeverity($v['sev']);
+            if ($mapped === 'critical') { $worst = 'critical'; break; }
+            if ($mapped === 'warning') $worst = 'warning';
+        }
+
+        $verNote = $this->detectedCmsVersion !== ''
+            ? " Detected version: {$cms} {$this->detectedCmsVersion} — confirm against each CVE's affected range."
+            : '';
+        $kindWord  = $cms === 'Joomla' ? 'extension' : 'plugin';
+        $matchNote = $matched
+            ? ' ' . count($matched) . " affect a {$kindWord} fingerprinted as INSTALLED on this site — see flagged items."
+            : ' None matched a fingerprinted installed plugin/extension in this scan; listed CVEs are ecosystem intelligence only.';
+        $this->addFinding('Technology', 'CMS CVEs', $worst,
+            "{$total} {$cms}-related CVE(s) published in the last {$windowDays} days (" . count($critHigh) . " critical/high).{$matchNote}{$verNote}",
+            $matched
+                ? 'Review installed matches first and patch affected core/plugins/extensions immediately.'
+                : 'Use this as inventory intelligence. Patch only if your installed core/plugins/extensions fall in an affected range.',
+            ['https://nvd.nist.gov/vuln/search'],
+            count($matched) > 0);
+
+        // Surface the most recent CVEs, but never drop a confirmed-installed
+        // match: show all matches plus enough recent ones to fill the cap.
+        $cap   = max(12, count($matched));
+        $shown = array_slice($cves, 0, $cap);
+        foreach ($shown as $v) {
+            $date  = substr($v['published'], 0, 10);
+            $score = $v['score'] !== null ? sprintf('%.1f %s', $v['score'], $v['sev']) : $v['sev'];
+            $snippet = $this->truncate($v['desc'], 220);
+            if ($v['installed']) {
+                $kind = $cms === 'Joomla' ? 'EXTENSION' : 'PLUGIN';
+                $ver  = $this->installedPlugins[$v['slug']]['version'] ?? null;
+                $vtxt = $ver ? " (you appear to run v{$ver})" : '';
+                $msg  = "⚠ INSTALLED {$kind} '{$v['slug']}'{$vtxt} — [{$date}] CVSS {$score}. {$snippet}";
+                $rec  = "This {$kind} was fingerprinted on your site. Compare your installed version to the affected range and update/remove immediately.";
+                $sev  = $this->mapCveSeverity($v['sev']);
+            } else {
+                $msg  = "[{$date}] CVSS {$score}. Ecosystem CVE not confirmed installed on this site. {$snippet}";
+                $rec  = 'Check your actual installed core/plugins/extensions against the affected range; update only if applicable.';
+                $sev  = 'info';
+            }
+            $this->addFinding('Technology', $v['id'], $sev, $msg, $rec,
+                ['https://nvd.nist.gov/vuln/detail/' . $v['id']],
+                (bool)$v['installed']);
+        }
+    }
+
+    // ================================================================
+    //  10c. INSTALLED WORDPRESS PLUGIN FINGERPRINTING
+    // ================================================================
+
+    /**
+     * Black-box detection of installed WordPress plugins:
+     *  1. PASSIVE — scrape the already-fetched homepage HTML for
+     *     /wp-content/plugins/<slug>/ asset references and any "?ver=" tag.
+     *  2. ACTIVE  — for each discovered slug (bounded), fetch the plugin's
+     *     readme.txt and read its "Stable tag:" to confirm existence + version.
+     * Soft-404 catch-all responses are filtered via the shared baseline so a
+     * homepage returned for every path doesn't masquerade as a real readme.
+     */
+    private function detectInstalledPlugins(): void
+    {
+        $body = $this->responseBody;
+        if ($body === '') return;
+
+        // 1. Passive: slug + optional version from asset URLs.
+        $found = [];
+        if (preg_match_all(
+                '#/wp-content/plugins/([a-z0-9][a-z0-9._-]*)/[^"\'\s)]*?(?:\?[^"\'\s)]*?\bver=([0-9][0-9A-Za-z.\-]*))?#i',
+                $body, $m, PREG_SET_ORDER)) {
+            foreach ($m as $hit) {
+                $slug = strtolower($hit[1]);
+                $ver  = $hit[2] ?? '';
+                if (!isset($found[$slug]) || ($ver !== '' && ($found[$slug] === '' ))) {
+                    $found[$slug] = $ver;
+                }
+            }
+        }
+        if (!$found) {
+            $this->addFinding('Technology', 'Installed Plugins', 'info',
+                'No WordPress plugin assets were referenced in the homepage HTML.',
+                'Plugins may be bundled/minified; this is not proof none are installed.');
+            return;
+        }
+
+        // 2. Active: confirm via readme.txt (cap requests to stay polite).
+        $slugs = array_slice(array_keys($found), 0, 15);
+        $base  = $this->scheme . '://' . $this->hostname;
+        $mh    = curl_multi_init();
+        $handles = [];
+        foreach ($slugs as $slug) {
+            $ch = curl_init();
+            curl_setopt_array($ch, [
+                CURLOPT_URL => "{$base}/wp-content/plugins/{$slug}/readme.txt",
+                CURLOPT_RESOLVE => $this->pinResolve(), CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT => 6, CURLOPT_CONNECTTIMEOUT => 4,
+                CURLOPT_FOLLOWLOCATION => false, CURLOPT_USERAGENT => 'SecScan/2.1',
+                CURLOPT_SSL_VERIFYPEER => false,
+            ]);
+            $handles[$slug] = $ch;
+            curl_multi_add_handle($mh, $ch);
+        }
+        $running = null;
+        do { curl_multi_exec($mh, $running); curl_multi_select($mh, 0.5); } while ($running > 0);
+
+        foreach ($handles as $slug => $ch) {
+            $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $rb   = (string)curl_multi_getcontent($ch);
+            $confirmed = false;
+            $version   = $found[$slug] !== '' ? $found[$slug] : null;
+            if ($code === 200 && $rb !== '' && !$this->matchesBaseline($rb)
+                && stripos($rb, '=== ') !== false) {
+                $confirmed = true;
+                if (preg_match('/Stable tag:\s*([0-9][0-9A-Za-z.\-]*)/i', $rb, $vm)) {
+                    $version = $vm[1];
+                }
+            }
+            $this->installedPlugins[$slug] = ['version' => $version, 'confirmed' => $confirmed];
+            curl_multi_remove_handle($mh, $ch);
+            $this->closeCurl($ch);
+        }
+        curl_multi_close($mh);
+
+        // Report what was found.
+        $lines = [];
+        foreach ($this->installedPlugins as $slug => $info) {
+            $v = $info['version'] ? " v{$info['version']}" : '';
+            $c = $info['confirmed'] ? '' : ' (referenced, readme not public)';
+            $lines[] = "{$slug}{$v}{$c}";
+        }
+        $this->addFinding('Technology', 'Installed Plugins', 'info',
+            count($this->installedPlugins) . ' WordPress plugin(s) detected: ' . implode('; ', $lines) . '.',
+            'Each becomes a CVE matching target below. Remove unused plugins; keep the rest updated.');
+    }
+
+    /**
+     * Best-effort extraction of a WordPress plugin slug from a CVE record.
+     * Wordfence/wpscan CVEs reference plugins.trac.wordpress.org/browser/<slug>/
+     * or wordpress.org/plugins/<slug>/, which gives a reliable slug to match
+     * against the fingerprinted install base.
+     */
+    private function cvePluginSlug(array $cve): string
+    {
+        foreach (($cve['references'] ?? []) as $ref) {
+            $url = $ref['url'] ?? '';
+            if (preg_match('#plugins\.trac\.wordpress\.org/browser/([a-z0-9][a-z0-9._-]*)/#i', $url, $m)
+             || preg_match('#wordpress\.org/plugins/([a-z0-9][a-z0-9._-]*)/#i', $url, $m)
+             || preg_match('#/plugins/([a-z0-9][a-z0-9._-]*)/tags/#i', $url, $m)) {
+                return strtolower($m[1]);
+            }
+        }
+        return '';
+    }
+
+    // ================================================================
+    //  10d. INSTALLED JOOMLA EXTENSION FINGERPRINTING
+    // ================================================================
+
+    /**
+     * Black-box detection of installed Joomla extensions. Joomla has no
+     * readme.txt convention, but components/modules/plugins/templates expose
+     * their asset directories in the front-end HTML:
+     *   /components/com_<name>/   /modules/mod_<name>/
+     *   /media/com_<name>/        /plugins/<group>/<name>/
+     *   /templates/<name>/        /media/templates/site/<name>/
+     * We harvest those slugs (no reliable public version source, so version is
+     * left unknown) and match them to CVE product names below.
+     */
+    private function detectJoomlaExtensions(): void
+    {
+        $body = $this->responseBody;
+        if ($body === '') return;
+
+        $slugs = [];
+        $patterns = [
+            '#/components/(com_[a-z0-9_]+)/#i',
+            '#/media/(com_[a-z0-9_]+)/#i',
+            '#/modules/(mod_[a-z0-9_]+)/#i',
+            '#/plugins/[a-z0-9_]+/([a-z0-9_]+)/#i',
+            '#/templates/([a-z0-9_]+)/#i',
+        ];
+        // Joomla core slugs would produce generic-word tokens ("content",
+        // "users", "media") that match unrelated CVE descriptions — skip them
+        // so only third-party extensions are matched.
+        $core = [
+            'com_content','com_users','com_contact','com_banners','com_finder',
+            'com_tags','com_media','com_fields','com_menus','com_modules',
+            'com_plugins','com_templates','com_languages','com_cpanel','com_login',
+            'com_admin','com_ajax','com_config','com_mailto','com_wrapper',
+            'com_search','com_newsfeeds','com_categories','com_associations',
+            'com_actionlogs','com_privacy','com_workflow','com_postinstall',
+            'com_messages','com_redirect','com_checkin','com_installer',
+            'com_joomlaupdate','com_scheduler','com_guidedtours',
+            'mod_menu','mod_custom','mod_breadcrumbs','mod_search','mod_login',
+            'mod_footer','mod_banners','mod_articles_news','mod_articles_latest',
+            'system','content','index','cassiopeia','atum',
+        ];
+        foreach ($patterns as $re) {
+            if (preg_match_all($re, $body, $m)) {
+                foreach ($m[1] as $s) {
+                    $s = strtolower($s);
+                    if (in_array($s, $core, true)) continue;
+                    $slugs[$s] = $this->normaliseExtToken($s);
+                }
+            }
+        }
+
+        if (!$slugs) {
+            $this->addFinding('Technology', 'Installed Extensions', 'info',
+                'No Joomla component/module/template asset paths were referenced in the homepage HTML.',
+                'Assets may be combined/minified; this is not proof none are installed.');
+            return;
+        }
+
+        $this->installedExtensions = $slugs;
+        $this->addFinding('Technology', 'Installed Extensions', 'info',
+            count($slugs) . ' Joomla extension(s)/template(s) detected: ' . implode('; ', array_keys($slugs)) . '.',
+            'Each is matched against Joomla CVEs below. Remove unused extensions; keep the rest updated. '
+            . 'Versions are not publicly exposed, so confirm each against the affected range manually.');
+    }
+
+    /**
+     * If a Joomla CVE's product/description references a token matching one of
+     * the fingerprinted extensions, return that extension slug; else ''.
+     */
+    private function matchJoomlaExtension(array $cve): string
+    {
+        if (!$this->installedExtensions) return '';
+
+        // Build the haystack from affected product names + description.
+        $hay = '';
+        foreach (($cve['affected'] ?? []) as $aff) {
+            foreach (($aff['affectedData'] ?? []) as $ad) {
+                $hay .= ' ' . ($ad['product'] ?? '') . ' ' . ($ad['vendor'] ?? '');
+            }
+        }
+        foreach (($cve['descriptions'] ?? []) as $d) {
+            if (($d['lang'] ?? '') === 'en') { $hay .= ' ' . $d['value']; }
+        }
+        $hayNorm = $this->normaliseExtToken($hay);
+        if ($hayNorm === '') return '';
+
+        foreach ($this->installedExtensions as $slug => $token) {
+            // Require a reasonably specific token to avoid noise matches.
+            if (strlen($token) >= 5 && str_contains($hayNorm, $token)) {
+                return $slug;
+            }
+        }
+        return '';
+    }
+
+    /** Lowercase + strip com_/mod_/plg_ prefixes and all non-alphanumerics. */
+    private function normaliseExtToken(string $s): string
+    {
+        $s = strtolower($s);
+        $s = preg_replace('/\b(com_|mod_|plg_|tpl_)/', '', $s);
+        return preg_replace('/[^a-z0-9]/', '', $s);
+    }
+
+    /** Pull the best available CVSS base score/severity from an NVD metrics block. */
+    private function cvssFrom(array $metrics): array
+    {
+        foreach (['cvssMetricV40', 'cvssMetricV31', 'cvssMetricV30', 'cvssMetricV2'] as $key) {
+            if (!empty($metrics[$key][0]['cvssData'])) {
+                $d = $metrics[$key][0]['cvssData'];
+                $score = isset($d['baseScore']) ? (float)$d['baseScore'] : null;
+                $sev   = $d['baseSeverity'] ?? ($metrics[$key][0]['baseSeverity'] ?? $this->severityFromScore($score));
+                return ['score' => $score, 'severity' => strtoupper((string)$sev)];
+            }
+        }
+        return ['score' => null, 'severity' => 'UNKNOWN'];
+    }
+
+    private function severityFromScore(?float $s): string
+    {
+        if ($s === null) return 'UNKNOWN';
+        if ($s >= 9.0) return 'CRITICAL';
+        if ($s >= 7.0) return 'HIGH';
+        if ($s >= 4.0) return 'MEDIUM';
+        if ($s > 0.0)  return 'LOW';
+        return 'NONE';
+    }
+
+    /** Map NVD CVSS severity onto SecScan's finding severities. */
+    private function mapCveSeverity(string $sev): string
+    {
+        return match (strtoupper($sev)) {
+            'CRITICAL', 'HIGH' => 'critical',
+            'MEDIUM'           => 'warning',
+            default            => 'info',
+        };
+    }
+
+    private function truncate(string $s, int $len): string
+    {
+        $s = trim(preg_replace('/\s+/', ' ', $s));
+        return strlen($s) > $len ? substr($s, 0, $len - 1) . '…' : $s;
+    }
+
+    private function cveCachePath(string $cms, int $windowDays): ?string
+    {
+        $dataDir = (string)secscan_config('data_dir');
+        if ($dataDir === '') {
+            return null;
+        }
+
+        $cacheDir = rtrim($dataDir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'cache';
+        if (!is_dir($cacheDir) && !@mkdir($cacheDir, 0750, true) && !is_dir($cacheDir)) {
+            return null;
+        }
+
+        $slug = strtolower((string)preg_replace('/[^a-z0-9]+/i', '-', $cms));
+        $slug = trim($slug, '-') ?: 'cms';
+
+        return $cacheDir . DIRECTORY_SEPARATOR . "nvd-{$slug}-{$windowDays}d-" . gmdate('Ymd') . '.json';
+    }
+
+    private function readCveCache(string $path, int $ttl): ?string
+    {
+        if (!is_readable($path)) {
+            return null;
+        }
+
+        $mtime = @filemtime($path);
+        if ($mtime === false || (time() - $mtime) > $ttl) {
+            return null;
+        }
+
+        $body = @file_get_contents($path);
+        return is_string($body) && $body !== '' ? $body : null;
+    }
+
+    private function writeCveCache(string $path, string $body): void
+    {
+        if ($body === '') {
+            return;
+        }
+
+        $dir = dirname($path);
+        if (!is_dir($dir) || !is_writable($dir)) {
+            return;
+        }
+
+        $tmp = $path . '.' . bin2hex(random_bytes(4)) . '.tmp';
+        if (@file_put_contents($tmp, $body, LOCK_EX) === false) {
+            return;
+        }
+        @chmod($tmp, 0640);
+        @rename($tmp, $path);
+    }
+
+    /** Outbound GET to the NVD API. Returns the raw body, or null on failure. */
+    private function fetchCveFeed(string $url, ?string $cachePath = null, int $cacheTtl = 86400): ?string
+    {
+        if ($cachePath !== null) {
+            $cached = $this->readCveCache($cachePath, $cacheTtl);
+            if ($cached !== null) {
+                return $cached;
+            }
+        }
+
+        $ch = curl_init();
+        $headers = ['Accept: application/json'];
+        if ($key = getenv('SECSCAN_NVD_API_KEY')) $headers[] = 'apiKey: ' . $key;
+
+        curl_setopt_array($ch, [
+            CURLOPT_URL            => $url,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 15,
+            CURLOPT_CONNECTTIMEOUT => 8,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_USERAGENT      => 'SecScan/2.1 (+CVE lookup)',
+            CURLOPT_HTTPHEADER     => $headers,
+            // NVD presents a valid public cert; verification stays on here
+            // because — unlike the user-supplied scan target — this host is
+            // fixed and trusted.
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+        ]);
+        $body = curl_exec($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $this->closeCurl($ch);
+
+        if ($body === false || $code !== 200) {
+            if ($cachePath !== null && is_readable($cachePath)) {
+                $stale = @file_get_contents($cachePath);
+                if (is_string($stale) && $stale !== '') {
+                    return $stale;
+                }
+            }
+            return null;
+        }
+
+        $body = (string)$body;
+        if ($cachePath !== null) {
+            $this->writeCveCache($cachePath, $body);
+        }
+
+        return $body;
     }
 
     // ================================================================
@@ -1533,12 +2481,12 @@ class SecurityScanner
         $handles = [];
         foreach ($paths as $p) {
             $ch = curl_init();
-            curl_setopt_array($ch, [
+            curl_setopt_array($ch, $this->withAuth([
                 CURLOPT_URL => $base . $p, CURLOPT_RESOLVE => $this->pinResolve(), CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_TIMEOUT => 6, CURLOPT_CONNECTTIMEOUT => 4,
                 CURLOPT_FOLLOWLOCATION => false, CURLOPT_USERAGENT => 'SecScan/2.1',
                 CURLOPT_SSL_VERIFYPEER => false,
-            ]);
+            ]));
             $handles[$p] = $ch;
             curl_multi_add_handle($mh, $ch);
         }
@@ -1626,7 +2574,7 @@ class SecurityScanner
 
         foreach ($files as $path => [$desc, $critical]) {
             $ch = curl_init();
-            curl_setopt_array($ch, [CURLOPT_URL => $base . $path, CURLOPT_RESOLVE => $this->pinResolve(), CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 6, CURLOPT_CONNECTTIMEOUT => 4, CURLOPT_FOLLOWLOCATION => false, CURLOPT_USERAGENT => 'SecScan/2.0', CURLOPT_SSL_VERIFYPEER => false]);
+            curl_setopt_array($ch, $this->withAuth([CURLOPT_URL => $base . $path, CURLOPT_RESOLVE => $this->pinResolve(), CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 6, CURLOPT_CONNECTTIMEOUT => 4, CURLOPT_FOLLOWLOCATION => false, CURLOPT_USERAGENT => 'SecScan/2.0', CURLOPT_SSL_VERIFYPEER => false]));
             $handles[$path] = ['handle' => $ch, 'desc' => $desc, 'critical' => $critical];
             curl_multi_add_handle($mh, $ch);
         }
@@ -1713,7 +2661,7 @@ class SecurityScanner
 
         foreach ($endpoints as $path => [$desc, $critical]) {
             $ch = curl_init();
-            curl_setopt_array($ch, [
+            curl_setopt_array($ch, $this->withAuth([
                 CURLOPT_URL            => $base . $path,
                 CURLOPT_RESOLVE        => $this->pinResolve(),
                 CURLOPT_RETURNTRANSFER => true,
@@ -1722,7 +2670,7 @@ class SecurityScanner
                 CURLOPT_FOLLOWLOCATION => false,
                 CURLOPT_USERAGENT      => 'SecScan/2.0',
                 CURLOPT_SSL_VERIFYPEER => false,
-            ]);
+            ]));
             $handles[$path] = ['handle' => $ch, 'desc' => $desc, 'critical' => $critical];
             curl_multi_add_handle($mh, $ch);
         }
@@ -2423,6 +3371,7 @@ class SecurityScanner
         $ch = curl_init();
         curl_setopt_array($ch, [
             CURLOPT_URL            => $this->scheme . '://' . $host . '/',
+            CURLOPT_RESOLVE        => $this->pinResolve(),
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT        => 8,
             CURLOPT_CONNECTTIMEOUT => 5,
@@ -2544,11 +3493,11 @@ class SecurityScanner
         $handles = [];
         foreach ($targets as $path => $desc) {
             $ch = curl_init();
-            curl_setopt_array($ch, [
+            curl_setopt_array($ch, $this->withAuth([
                 CURLOPT_URL => $base . $path, CURLOPT_RESOLVE => $this->pinResolve(),
                 CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 6, CURLOPT_CONNECTTIMEOUT => 4,
                 CURLOPT_FOLLOWLOCATION => false, CURLOPT_USERAGENT => 'SecScan/2.1', CURLOPT_SSL_VERIFYPEER => false,
-            ]);
+            ]));
             $handles[$path] = ['ch' => $ch, 'desc' => $desc];
             curl_multi_add_handle($mh, $ch);
         }
@@ -2604,11 +3553,11 @@ class SecurityScanner
         $handles = [];
         foreach ($dirs as $d) {
             $ch = curl_init();
-            curl_setopt_array($ch, [
+            curl_setopt_array($ch, $this->withAuth([
                 CURLOPT_URL => $base . $d, CURLOPT_RESOLVE => $this->pinResolve(),
                 CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 6, CURLOPT_CONNECTTIMEOUT => 4,
                 CURLOPT_FOLLOWLOCATION => false, CURLOPT_USERAGENT => 'SecScan/2.1', CURLOPT_SSL_VERIFYPEER => false,
-            ]);
+            ]));
             $handles[$d] = $ch;
             curl_multi_add_handle($mh, $ch);
         }
@@ -2733,6 +3682,266 @@ class SecurityScanner
         }
     }
 
+    // ================================================================
+    //  API / GRAPHQL INTROSPECTION
+    // ================================================================
+    //
+    // A GraphQL endpoint with introspection left enabled hands attackers the
+    // full schema — every type, field, mutation and argument — which massively
+    // accelerates API abuse. We POST a minimal introspection query to common
+    // paths and report when the schema is returned.
+
+    private function checkApiGraphQL(): void
+    {
+        $base    = $this->scheme . '://' . $this->hostname;
+        $paths   = ['/graphql', '/api/graphql', '/v1/graphql', '/graphql/v1', '/query'];
+        $payload = '{"query":"query{__schema{queryType{name}}}"}';
+
+        $introspectableAt = null;
+        $presentAt        = null;
+
+        foreach ($paths as $path) {
+            $ch = curl_init();
+            curl_setopt_array($ch, $this->withAuth([
+                CURLOPT_URL            => $base . $path,
+                CURLOPT_RESOLVE        => $this->pinResolve(),
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT        => 8,
+                CURLOPT_CONNECTTIMEOUT => 5,
+                CURLOPT_FOLLOWLOCATION => false,
+                CURLOPT_USERAGENT      => 'SecScan/2.1',
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_POST           => true,
+                CURLOPT_POSTFIELDS     => $payload,
+                CURLOPT_HTTPHEADER     => ['Content-Type: application/json', 'Accept: application/json'],
+            ]));
+            $body       = (string)@curl_exec($ch);
+            $hitPrivate = $this->curlHitPrivateIp($ch);
+            $this->closeCurl($ch);
+            if ($hitPrivate) return; // SSRF guard — abort the whole check
+            if ($body === '' || $this->matchesBaseline($body)) continue;
+
+            $class = $this->classifyGraphqlResponse($body);
+            if ($class === 'enabled') { $introspectableAt = $path; break; }
+            if ($class === 'present' && $presentAt === null) { $presentAt = $path; }
+        }
+
+        if ($introspectableAt !== null) {
+            $this->addFinding('API', 'GraphQL Introspection', 'warning',
+                "GraphQL introspection is enabled at {$introspectableAt} — the full API schema is publicly queryable.",
+                'Disable introspection in production (e.g. Apollo introspection:false, or a validation rule blocking __schema/__type), and require authentication on the GraphQL endpoint.',
+                ['https://cheatsheetseries.owasp.org/cheatsheets/GraphQL_Cheat_Sheet.html']);
+        } elseif ($presentAt !== null) {
+            $this->addFinding('API', 'GraphQL Introspection', 'pass',
+                "A GraphQL endpoint was found at {$presentAt} but introspection appears disabled.",
+                '', ['https://cheatsheetseries.owasp.org/cheatsheets/GraphQL_Cheat_Sheet.html']);
+        } else {
+            $this->addFinding('API', 'GraphQL Introspection', 'info',
+                'No public GraphQL endpoint was found at common paths.',
+                '', [], false);
+        }
+    }
+
+    /**
+     * Classify a GraphQL HTTP response body. Pure/offline for unit testing.
+     *   'enabled' — introspection returned a schema
+     *   'present' — endpoint is GraphQL but introspection is off / errored
+     *   'none'    — not a GraphQL endpoint
+     */
+    public function classifyGraphqlResponse(string $body): string
+    {
+        if ($body === '') return 'none';
+        $sample = substr($body, 0, 200000);
+
+        if (strpos($sample, '"__schema"') !== false || strpos($sample, '"queryType"') !== false) {
+            return 'enabled';
+        }
+        // GraphQL servers answer non-query requests with recognisable errors.
+        $graphqlSignals = [
+            'Must provide query string',
+            'GraphQLError',
+            'Cannot query field',
+            'introspection is disabled',
+            'introspection has been disabled',
+            'must provide an operation',
+            'Syntax Error: Unexpected',
+            'PersistedQueryNotFound',
+        ];
+        foreach ($graphqlSignals as $sig) {
+            if (stripos($sample, $sig) !== false) return 'present';
+        }
+        // An "errors" array that also mentions graphql is a decent tell.
+        if (stripos($sample, '"errors"') !== false && stripos($sample, 'graphql') !== false) {
+            return 'present';
+        }
+        return 'none';
+    }
+
+    // ================================================================
+    //  EMAIL AUTH HARDENING DEPTH (SPF / DMARC / TLS-RPT)
+    // ================================================================
+    //
+    // checkDNSSecurity() reports presence/absence of SPF, DMARC and DKIM.
+    // This adds the deeper, spoofing-relevant analysis: SPF DNS-lookup limits,
+    // deprecated/dangerous mechanisms, duplicate SPF records (which cause a
+    // permerror), DMARC enforcement coverage (pct/sp/rua), and SMTP TLS
+    // reporting. Only runs for domains that actually handle mail.
+
+    private function checkEmailAuthHardening(): void
+    {
+        $base = preg_replace('/^www\./i', '', $this->hostname);
+
+        $txt = @dns_get_record($base, DNS_TXT) ?: [];
+        $spfRecords = [];
+        foreach ($txt as $r) {
+            $s = is_array($r['entries'] ?? null) ? implode('', $r['entries']) : ($r['txt'] ?? '');
+            if (stripos($s, 'v=spf1') === 0) $spfRecords[] = $s;
+        }
+        $mx = @dns_get_record($base, DNS_MX) ?: [];
+
+        // Skip non-mail domains to avoid advisory noise.
+        if (empty($mx) && empty($spfRecords)) return;
+
+        // --- SPF depth ---
+        if (count($spfRecords) > 1) {
+            $this->addFinding('DNS', 'SPF Multiple Records', 'critical',
+                'More than one v=spf1 TXT record is published — this is a permanent error (permerror) and receivers may ignore SPF entirely.',
+                'Publish exactly one SPF record; merge all mechanisms into a single v=spf1 line.');
+        } elseif (count($spfRecords) === 1) {
+            $a = $this->analyzeSpfRecord($spfRecords[0]);
+            if ($a['lookups'] > 10) {
+                $this->addFinding('DNS', 'SPF Lookup Limit', 'warning',
+                    "SPF references ~{$a['lookups']} DNS-lookup mechanisms directly (RFC 7208 hard limit is 10; nested includes add more). Exceeding it causes a permerror.",
+                    'Reduce include:/a/mx/exists mechanisms, flatten SPF, or use a hosted SPF-flattening service.');
+            } elseif ($a['lookups'] >= 8) {
+                $this->addFinding('DNS', 'SPF Lookup Limit', 'info',
+                    "SPF uses ~{$a['lookups']} DNS-lookup mechanisms directly — approaching the RFC 7208 limit of 10 once nested includes are counted.",
+                    'Keep the total (including nested includes) at or under 10.');
+            }
+            foreach ($a['issues'] as $issue) {
+                $this->addFinding('DNS', 'SPF Mechanisms', 'warning',
+                    "SPF record {$issue}.",
+                    'Tighten the SPF record; remove deprecated/permissive mechanisms.');
+            }
+        }
+
+        // --- DMARC depth ---
+        $dmarcRecs = @dns_get_record("_dmarc.{$base}", DNS_TXT) ?: [];
+        foreach ($dmarcRecs as $r) {
+            $s = is_array($r['entries'] ?? null) ? implode('', $r['entries']) : ($r['txt'] ?? '');
+            if (stripos($s, 'v=DMARC1') !== 0) continue;
+            $d = $this->analyzeDmarcRecord($s);
+            foreach ($d['issues'] as $issue) {
+                $this->addFinding('DNS', 'DMARC Coverage', 'warning',
+                    "DMARC {$issue}.",
+                    'Enforce on all mail: p=reject (or quarantine), sp matching p, pct=100, and a rua= address for aggregate reports.');
+            }
+            foreach ($d['notes'] as $note) {
+                $this->addFinding('DNS', 'DMARC Coverage', 'info', "DMARC {$note}.");
+            }
+            break;
+        }
+
+        // --- SMTP TLS reporting (TLS-RPT) ---
+        if (!empty($mx)) {
+            $tlsrpt = @dns_get_record("_smtp._tls.{$base}", DNS_TXT) ?: [];
+            $hasTlsRpt = false;
+            foreach ($tlsrpt as $r) {
+                $s = is_array($r['entries'] ?? null) ? implode('', $r['entries']) : ($r['txt'] ?? '');
+                if (stripos($s, 'v=TLSRPTv1') === 0) { $hasTlsRpt = true; break; }
+            }
+            if ($hasTlsRpt) {
+                $this->addFinding('DNS', 'TLS-RPT', 'pass', 'SMTP TLS reporting (TLS-RPT) is published.');
+            } else {
+                $this->addFinding('DNS', 'TLS-RPT', 'info',
+                    'No SMTP TLS reporting (TLS-RPT) record found.',
+                    'Publish _smtp._tls TXT (v=TLSRPTv1; rua=mailto:tlsrpt@...) to receive delivery/TLS failure reports.');
+            }
+        }
+    }
+
+    /**
+     * Analyse an SPF record. Pure/offline for unit testing.
+     * Returns ['lookups' => int, 'issues' => string[]]. `lookups` counts the
+     * DNS-lookup mechanisms present in *this* record only (nested includes not
+     * expanded), so it is a lower bound on the RFC 7208 count.
+     *
+     * @return array{lookups:int, issues:string[]}
+     */
+    public function analyzeSpfRecord(string $spf): array
+    {
+        $tokens  = preg_split('/\s+/', trim($spf)) ?: [];
+        $lookups = 0;
+        $issues  = [];
+        $hasAll  = false;
+
+        foreach ($tokens as $tok) {
+            if ($tok === '') continue;
+            $bare = ltrim($tok, '+-~?');
+            $low  = strtolower($bare);
+
+            if (str_starts_with($low, 'include:') || str_starts_with($low, 'exists:') || str_starts_with($low, 'redirect=')) {
+                $lookups++;
+            } elseif ($low === 'a' || str_starts_with($low, 'a:') || str_starts_with($low, 'a/')) {
+                $lookups++;
+            } elseif ($low === 'mx' || str_starts_with($low, 'mx:') || str_starts_with($low, 'mx/')) {
+                $lookups++;
+            } elseif ($low === 'ptr' || str_starts_with($low, 'ptr:')) {
+                $lookups++;
+                $issues[] = 'uses the deprecated and unreliable ptr mechanism';
+            }
+
+            if ($low === 'all') {
+                $hasAll = true;
+                $qual = $tok[0] ?? '+';
+                if ($qual === '?') $issues[] = "uses neutral '?all' which provides no protection";
+            }
+        }
+
+        if (!$hasAll) $issues[] = "has no 'all' mechanism, leaving the default policy undefined";
+
+        return ['lookups' => $lookups, 'issues' => $issues];
+    }
+
+    /**
+     * Analyse a DMARC record. Pure/offline for unit testing.
+     * Returns ['issues' => string[], 'notes' => string[]].
+     *
+     * @return array{issues:string[], notes:string[]}
+     */
+    public function analyzeDmarcRecord(string $dmarc): array
+    {
+        $tags = [];
+        foreach (explode(';', $dmarc) as $part) {
+            $part = trim($part);
+            if ($part === '' || strpos($part, '=') === false) continue;
+            [$k, $v] = explode('=', $part, 2);
+            $tags[strtolower(trim($k))] = trim($v);
+        }
+
+        $issues = [];
+        $notes  = [];
+        $p = strtolower($tags['p'] ?? '');
+
+        if (isset($tags['pct']) && (int)$tags['pct'] < 100) {
+            $issues[] = "applies to only {$tags['pct']}% of mail (pct=" . (int)$tags['pct'] . ') — the rest is unenforced';
+        }
+        if (empty($tags['rua'])) {
+            $issues[] = 'has no rua= aggregate-report address, so you get no visibility into spoofing attempts';
+        }
+        if (isset($tags['sp'])) {
+            $sp = strtolower($tags['sp']);
+            if ($sp === 'none' && in_array($p, ['quarantine', 'reject'], true)) {
+                $issues[] = "sets a weaker subdomain policy (sp=none) than the domain policy (p={$p}), leaving subdomains spoofable";
+            }
+        }
+        if (($tags['adkim'] ?? 'r') === 'r' || ($tags['aspf'] ?? 'r') === 'r') {
+            $notes[] = 'uses relaxed alignment (adkim/aspf=r); strict alignment (s) is tighter if your mail flow supports it';
+        }
+
+        return ['issues' => $issues, 'notes' => $notes];
+    }
+
     private function referencesFor(string $category, string $check): array
     {
         $c = strtolower($check);
@@ -2751,6 +3960,8 @@ class SecurityScanner
             'spf'                      => ['https://datatracker.ietf.org/doc/html/rfc7208', 'https://dmarcian.com/spf-syntax-table/'],
             'dmarc'                    => ['https://datatracker.ietf.org/doc/html/rfc7489', 'https://dmarc.org/overview/'],
             'dkim'                     => ['https://datatracker.ietf.org/doc/html/rfc6376'],
+            'tls-rpt'                  => ['https://datatracker.ietf.org/doc/html/rfc8460'],
+            'graphql'                  => ['https://cheatsheetseries.owasp.org/cheatsheets/GraphQL_Cheat_Sheet.html'],
             'dnssec'                   => ['https://www.icann.org/resources/pages/dnssec-what-is-it-why-important-2019-03-05-en'],
             'caa'                      => ['https://datatracker.ietf.org/doc/html/rfc8659'],
             'mta-sts'                  => ['https://datatracker.ietf.org/doc/html/rfc8461'],
@@ -2765,6 +3976,8 @@ class SecurityScanner
             'sensitive file'           => ['https://owasp.org/Top10/A05_2021-Security_Misconfiguration/', 'https://owasp.org/www-project-web-security-testing-guide/stable/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information.html'],
             'admin'                    => ['https://owasp.org/www-project-web-security-testing-guide/'],
             'sri'                      => ['https://developer.mozilla.org/en-US/docs/Web/Security/Subresource_Integrity'],
+            'csrf'                     => ['https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html', 'https://owasp.org/www-community/attacks/csrf'],
+            'secret'                   => ['https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html', 'https://owasp.org/Top10/A05_2021-Security_Misconfiguration/'],
             'mixed content'            => ['https://developer.mozilla.org/en-US/docs/Web/Security/Mixed_content'],
             'port'                     => ['https://owasp.org/www-project-web-security-testing-guide/'],
         ];
@@ -2779,21 +3992,37 @@ class SecurityScanner
     //  SCORING
     // ================================================================
 
+    /** @return SecurityFinding[] */
+    private function scoreableFindings(): array
+    {
+        return array_values(array_filter($this->findings, fn($f) => $f->scoreable));
+    }
+
+    private function gradeForScore(int $score): string
+    {
+        if ($score >= 90) return 'A+';
+        if ($score >= 80) return 'A';
+        if ($score >= 70) return 'B';
+        if ($score >= 60) return 'C';
+        if ($score >= 45) return 'D';
+        return 'F';
+    }
+
     private function calculateScore(): array
     {
-        if (empty($this->findings)) return ['score' => 0, 'grade' => 'F'];
-        $weights = ['pass' => 100, 'info' => 70, 'warning' => 35, 'critical' => 0];
-        $total   = 0;
-        foreach ($this->findings as $f) $total += $weights[$f->severity] ?? 0;
-        $score = (int)round($total / count($this->findings));
-        if ($score >= 90) $grade = 'A+';
-        elseif ($score >= 80) $grade = 'A';
-        elseif ($score >= 70) $grade = 'B';
-        elseif ($score >= 60) $grade = 'C';
-        elseif ($score >= 45) $grade = 'D';
-        else $grade = 'F';
+        $findings = $this->scoreableFindings();
+        if (empty($findings)) return ['score' => 0, 'grade' => 'F'];
 
-        $crits = count(array_filter($this->findings, fn($f) => $f->severity === 'critical'));
+        // 'info' findings are advisory (e.g. "no IPv6", "DNSSEC not detected"),
+        // not security failures, so they are weighted close to a pass and don't
+        // unfairly cap the grade of an otherwise well-configured site.
+        $weights = ['pass' => 100, 'info' => 85, 'warning' => 35, 'critical' => 0];
+        $total   = 0;
+        foreach ($findings as $f) $total += $weights[$f->severity] ?? 0;
+        $score = (int)round($total / count($findings));
+        $grade = $this->gradeForScore($score);
+
+        $crits = count(array_filter($findings, fn($f) => $f->severity === 'critical'));
         if ($crits >= 5 && in_array($grade, ['A+', 'A', 'B', 'C'])) $grade = 'D';
         elseif ($crits >= 3 && in_array($grade, ['A+', 'A', 'B']))   $grade = 'C';
         elseif ($crits >= 1 && $grade === 'A+')                       $grade = 'A';
@@ -2810,6 +4039,7 @@ class SecurityScanner
         $scoring = $this->calculateScore();
         $elapsed = round(microtime(true) - $this->scanStart, 2);
         $categories = [];
+        $scoreableCount = count($this->scoreableFindings());
         foreach ($this->findings as $f) {
             $categories[$f->category][] = [
                 'check'          => $f->check,
@@ -2817,6 +4047,7 @@ class SecurityScanner
                 'message'        => $f->message,
                 'recommendation' => $f->recommendation,
                 'references'     => $f->references,
+                'scoreable'      => $f->scoreable,
             ];
         }
         $counts = ['pass' => 0, 'info' => 0, 'warning' => 0, 'critical' => 0];
@@ -2825,14 +4056,19 @@ class SecurityScanner
         return [
             'url'             => $this->url,
             'hostname'        => $this->hostname,
+            'authenticated'   => $this->authEnabled,
             'score'           => $scoring['score'],
             'grade'           => $scoring['grade'],
             'total_checks'    => count($this->findings),
+            'scoreable_checks' => $scoreableCount,
             'passed'          => $counts['pass'],
             'info'            => $counts['info'],
             'warnings'        => $counts['warning'],
             'critical'        => $counts['critical'],
             'server_ip'       => ['ipv4' => array_values(array_unique($this->resolvedIpv4)), 'ipv6' => array_values(array_unique($this->resolvedIpv6))],
+            'detected_cms'    => $this->detectedCms,
+            'detected_cms_version' => $this->detectedCmsVersion,
+            'detected_cms_signals' => $this->detectedCmsSignals,
             'edge'            => ['cloudflare' => $this->isCloudflareEdge()],
             'tls'             => [
                 'protocol'       => $this->negotiatedTlsProtocol,
@@ -2854,15 +4090,15 @@ class SecurityScanner
      */
     private function categoryScores(): array
     {
-        $weights = ['pass' => 100, 'info' => 70, 'warning' => 35, 'critical' => 0];
+        $weights = ['pass' => 100, 'info' => 85, 'warning' => 35, 'critical' => 0];
         $buckets = [];
-        foreach ($this->findings as $f) {
+        foreach ($this->scoreableFindings() as $f) {
             $buckets[$f->category][] = $weights[$f->severity] ?? 0;
         }
         $out = [];
         foreach ($buckets as $cat => $scores) {
             $avg = (int) round(array_sum($scores) / count($scores));
-            $grade = $avg >= 90 ? 'A+' : ($avg >= 80 ? 'A' : ($avg >= 70 ? 'B' : ($avg >= 60 ? 'C' : ($avg >= 45 ? 'D' : 'F'))));
+            $grade = $this->gradeForScore($avg);
             $out[$cat] = ['score' => $avg, 'grade' => $grade, 'checks' => count($scores)];
         }
         // Weakest categories first — most useful ordering for a reader.
@@ -2883,6 +4119,7 @@ class SecurityScanner
 
         $items = [];
         foreach ($this->findings as $f) {
+            if (!$f->scoreable) continue;
             if (!isset($rank[$f->severity])) continue; // skip pass/info
             $items[] = $f;
         }

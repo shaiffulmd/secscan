@@ -14,6 +14,9 @@
   "scripts": {
     "check": "php scripts/check.php",
     "preflight": "php scripts/preflight.php",
-    "test:baseline": "php scripts/test_baseline.php"
+    "test:baseline": "php scripts/test_baseline.php",
+    "test:regression": "php scripts/test_regression.php",
+    "test:detection": "php scripts/test_detection.php",
+    "test": "php scripts/test_regression.php"
   }
 }

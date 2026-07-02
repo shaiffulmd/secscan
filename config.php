@@ -119,6 +119,12 @@ function secscan_config(?string $key = null)
             'trusted_proxies' => secscan_env('SECSCAN_TRUSTED_PROXIES', ''),
             // Set to "1" to additionally trust Cloudflare's published edge ranges.
             'trust_cloudflare' => secscan_env('SECSCAN_TRUST_CLOUDFLARE', '0'),
+            // Authenticated scanning: accept per-request session cookies / auth
+            // headers so scans can run behind a login. OFF by default because a
+            // public, unauthenticated API endpoint that forwards arbitrary
+            // credentials to arbitrary hosts is an abuse vector — enable this
+            // only on access-controlled deployments.
+            'allow_auth_scan' => secscan_env('SECSCAN_ALLOW_AUTH_SCAN', '0') === '1',
         ];
     }
 
