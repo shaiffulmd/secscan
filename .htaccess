@@ -55,3 +55,16 @@ DirectoryIndex index.php
         Header always set Cache-Control "public, max-age=604800, immutable"
     </FilesMatch>
 </IfModule>
+
+# Hidangkan skrip audit sebagai teks biasa + paksa muat turun (bukan dijalankan).
+<FilesMatch "^audit\.sh$">
+    ForceType text/plain
+    Header set Content-Disposition "attachment; filename=audit.sh"
+    Header set Cache-Control "public, max-age=3600"
+</FilesMatch>
+
+# Ebook PDF — benarkan muat turun.
+<FilesMatch "\.pdf$">
+    Header set Content-Disposition "attachment"
+    Header set Cache-Control "public, max-age=86400"
+</FilesMatch>

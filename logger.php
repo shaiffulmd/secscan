@@ -6,7 +6,8 @@ require_once __DIR__ . '/config.php';
  * ScanLogger — simpan setiap scan ke SQLite dan sediakan data untuk dashboard.
  *
  * Database disimpan di data/secscan.db (dilindungi oleh data/.htaccess).
- * IP pengguna di-hash (SHA-256 + salt) untuk privasi — tidak disimpan dalam plaintext.
+ * IP pengguna disimpan untuk audit dashboard dan turut di-hash (SHA-256 + salt)
+ * untuk statistik unique-IP tanpa bergantung pada plaintext.
  */
 class ScanLogger
 {
@@ -64,17 +65,44 @@ class ScanLogger
                 info          INTEGER NOT NULL DEFAULT 0,
                 total_checks  INTEGER NOT NULL DEFAULT 0,
                 duration_ms   INTEGER NOT NULL DEFAULT 0,
+                client_ip     TEXT,
                 client_ip_hash TEXT,
                 tls_protocol  TEXT,
+                detected_cms  TEXT,
+                detected_cms_version TEXT,
+                scan_blocked  INTEGER NOT NULL DEFAULT 0,
+                scan_blocked_type TEXT,
                 is_cloudflare INTEGER NOT NULL DEFAULT 0,
                 top_issues    TEXT
             )
         ");
 
+        $this->ensureColumn('scans', 'client_ip', 'TEXT');
+        $this->ensureColumn('scans', 'client_ip_hash', 'TEXT');
+        $this->ensureColumn('scans', 'tls_protocol', 'TEXT');
+        $this->ensureColumn('scans', 'detected_cms', 'TEXT');
+        $this->ensureColumn('scans', 'detected_cms_version', 'TEXT');
+        $this->ensureColumn('scans', 'scan_blocked', 'INTEGER NOT NULL DEFAULT 0');
+        $this->ensureColumn('scans', 'scan_blocked_type', 'TEXT');
+        $this->ensureColumn('scans', 'is_cloudflare', 'INTEGER NOT NULL DEFAULT 0');
+        $this->ensureColumn('scans', 'top_issues', 'TEXT');
+
         $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_scanned_at ON scans(scanned_at)");
         $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_hostname   ON scans(hostname)");
         $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_grade      ON scans(grade)");
+        $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_client_ip  ON scans(client_ip)");
         $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_ip_hash    ON scans(client_ip_hash)");
+    }
+
+    private function ensureColumn(string $table, string $column, string $definition): void
+    {
+        $cols = $this->pdo->query('PRAGMA table_info(' . $table . ')')->fetchAll();
+        foreach ($cols as $col) {
+            if (($col['name'] ?? '') === $column) {
+                return;
+            }
+        }
+        $this->pdo->exec('ALTER TABLE ' . $table . ' ADD COLUMN ' . $column . ' ' . $definition);
     }
 
     // ----------------------------------------------------------------
@@ -97,7 +125,7 @@ class ScanLogger
             }
             $topIssues = array_values(array_filter(array_unique($topIssues)));
 
-            // Hash IP — tidak simpan dalam plaintext
+            // Hash IP untuk statistik unique-IP, simpan plaintext untuk audit dashboard.
             $ipHash = $clientIp !== ''
                 ? hash('sha256', $clientIp . (string)secscan_config('ip_hash_salt'))
                 : null;
@@ -108,9 +136,10 @@ class ScanLogger
             $stmt = $this->pdo->prepare("
                 INSERT INTO scans
                     (hostname, url, score, grade, passed, warnings, critical, info,
-                     total_checks, duration_ms, client_ip_hash, tls_protocol,
+                     total_checks, duration_ms, client_ip, client_ip_hash, tls_protocol,
+                     detected_cms, detected_cms_version, scan_blocked, scan_blocked_type,
                      is_cloudflare, top_issues)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ");
 
             $stmt->execute([
@@ -124,8 +153,13 @@ class ScanLogger
                 (int)($result['info']          ?? 0),
                 (int)($result['total_checks']  ?? 0),
                 $durationMs,
+                $clientIp !== '' ? $clientIp : null,
                 $ipHash,
                 $result['tls']['protocol']     ?? null,
+                $result['detected_cms']         ?? null,
+                $result['detected_cms_version'] ?? null,
+                !empty($result['scan_blocked']) ? 1 : 0,
+                $result['scan_blocked_type']    ?? null,
                 ($result['edge']['cloudflare'] ?? false) ? 1 : 0,
                 json_encode(array_slice($topIssues, 0, 15), JSON_UNESCAPED_UNICODE),
             ]);
@@ -151,7 +185,8 @@ class ScanLogger
                     ROUND(AVG(duration_ms) / 1000.0, 1)           AS avg_duration_s,
                     SUM(CASE WHEN grade IN ('A+','A') THEN 1 ELSE 0 END) AS grade_a_count,
                     SUM(critical)                                 AS total_critical,
-                    SUM(CASE WHEN critical > 0 THEN 1 ELSE 0 END) AS scans_with_criticals
+                    SUM(CASE WHEN critical > 0 THEN 1 ELSE 0 END) AS scans_with_criticals,
+                    SUM(CASE WHEN scan_blocked = 1 THEN 1 ELSE 0 END) AS scan_blocked_total
                 FROM scans
             ")->fetch();
             return $row ?: [];
@@ -217,6 +252,25 @@ class ScanLogger
         } catch (Throwable) { return []; }
     }
 
+    public function getCdnDomains(int $limit = 10): array
+    {
+        if (!$this->connect()) return [];
+        try {
+            $limit = max(1, min(100, $limit));
+            return $this->pdo->query("
+                SELECT hostname,
+                       COUNT(*) AS scan_count,
+                       MAX(scanned_at) AS last_scan,
+                       ROUND(AVG(score), 1) AS avg_score
+                FROM scans
+                WHERE is_cloudflare = 1
+                GROUP BY hostname
+                ORDER BY last_scan DESC
+                LIMIT {$limit}
+            ")->fetchAll();
+        } catch (Throwable) { return []; }
+    }
+
     public function getTopIssues(int $limit = 12): array
     {
         if (!$this->connect()) return [];
@@ -267,7 +321,9 @@ class ScanLogger
             $offset = max(0, $offset);
             return $this->pdo->query("
                 SELECT id, scanned_at, hostname, score, grade, passed, warnings,
-                       critical, total_checks, duration_ms, tls_protocol, is_cloudflare
+                       critical, total_checks, duration_ms, client_ip, tls_protocol,
+                       detected_cms, detected_cms_version, scan_blocked, scan_blocked_type,
+                       is_cloudflare
                 FROM scans
                 ORDER BY scanned_at DESC
                 LIMIT {$limit} OFFSET {$offset}

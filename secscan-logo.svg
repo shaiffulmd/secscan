@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-labelledby="title desc">
+  <title id="title">SecScan logo</title>
+  <desc id="desc">A shield with scan lines and a verified security check.</desc>
+  <defs>
+    <linearGradient id="shield" x1="18" y1="12" x2="78" y2="86" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1FA99A"/>
+      <stop offset="0.52" stop-color="#0F766E"/>
+      <stop offset="1" stop-color="#155E75"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="25" y1="25" x2="72" y2="73" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#A7F3D0"/>
+      <stop offset="1" stop-color="#7DD3FC"/>
+    </linearGradient>
+    <filter id="softShadow" x="-20%" y="-16%" width="140%" height="140%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#0F172A" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+  <path fill="url(#shield)" filter="url(#softShadow)" d="M48 7.5 78 18.2v24.5c0 19.6-11.7 36.1-30 45.8-18.3-9.7-30-26.2-30-45.8V18.2L48 7.5Z"/>
+  <path fill="#FFFFFF" fill-opacity="0.16" d="M48 13.9 72.4 22.6v20.2c0 16.2-9.3 29.8-24.4 38.4-15.1-8.6-24.4-22.2-24.4-38.4V22.6L48 13.9Z"/>
+  <path fill="none" stroke="#FFFFFF" stroke-opacity="0.42" stroke-width="2" d="M48 13.9 72.4 22.6v20.2c0 16.2-9.3 29.8-24.4 38.4-15.1-8.6-24.4-22.2-24.4-38.4V22.6L48 13.9Z"/>
+  <path fill="none" stroke="url(#beam)" stroke-linecap="round" stroke-width="5" d="M31 34.5h22.5M31 48h34M31 61.5h18.5"/>
+  <path fill="#FFFFFF" d="M65.5 38.8a8.7 8.7 0 1 0 0 17.4 8.7 8.7 0 0 0 0-17.4Zm-1 12.7-4-4 1.8-1.8 2.2 2.2 4.3-4.7 1.9 1.7-6.2 6.6Z"/>
+  <path fill="#A7F3D0" d="M29.5 32a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Zm0 13.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Zm0 13.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Z"/>
+</svg>

@@ -106,6 +106,10 @@ try {
         'ipv4' => $target['ipv4'],
         'ipv6' => $target['ipv6'],
     ];
+    $result['scan_client_ip'] = $clientIp;
+    $result['request'] = [
+        'client_ip' => $clientIp,
+    ];
 
     $sendJson($result);
 } catch (Throwable $e) {

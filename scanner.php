@@ -2,6 +2,7 @@
 
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/src/UrlGuard.php';
+require_once __DIR__ . '/src/JoomlaFingerprint.php';
 
 class SecurityFinding
 {
@@ -59,6 +60,12 @@ class SecurityScanner
     private string $detectedCms = '';
     private string $detectedCmsVersion = '';
     private array $detectedCmsSignals = [];
+    private array $scanBlocked = [];
+
+    // Weighted score from the passive Joomla fingerprint layer. Drives the
+    // active safety-net probe: a hardened Joomla site can score 0 passively,
+    // so probeJoomlaEndpoints() confirms it via Joomla-only endpoints.
+    private int $joomlaPassiveScore = 0;
 
     // Installed WordPress plugins fingerprinted from the target:
     //   slug => ['version' => ?string, 'confirmed' => bool]
@@ -1799,8 +1806,9 @@ class SecurityScanner
 
     private function checkCMSDetection(): void
     {
-        $bodySample = str_replace('\\/', '/', substr($this->responseBody, 0, 300000));
+        $bodySample = str_replace('\\/', '/', $this->cmsFingerprintBody());
         $lower      = strtolower($bodySample);
+        $cmsBodyBlocked = $this->bodyLooksLikeValidationChallenge($bodySample);
         $headerHints = strtolower(implode(' ', array_filter(array_merge(
             $this->getAllHeaders('link'),
             $this->getAllHeaders('x-generator'),
@@ -1808,23 +1816,17 @@ class SecurityScanner
             $this->getAllHeaders('x-pingback')
         ))));
 
-        $generator = '';
-        if (preg_match_all('/<meta\b[^>]*>/i', $bodySample, $metaTags)) {
-            foreach ($metaTags[0] as $tag) {
-                if (preg_match('/\bname\s*=\s*["\']generator["\']/i', $tag)
-                    && preg_match('/\bcontent\s*=\s*["\']([^"\']+)/i', $tag, $gm)) {
-                    $generator = html_entity_decode(trim($gm[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-                    break;
-                }
-            }
-        }
+        $generator = $this->extractMetaContent($bodySample, 'generator');
 
         $candidates = [];
-        $addSignal = static function (string $name, string $signal, string $version = '') use (&$candidates): void {
+        $addSignal = static function (string $name, string $signal, string $version = '', int $weight = 3) use (&$candidates): void {
             if (!isset($candidates[$name])) {
-                $candidates[$name] = ['signals' => [], 'version' => ''];
+                $candidates[$name] = ['signals' => [], 'version' => '', 'score' => 0];
             }
-            $candidates[$name]['signals'][$signal] = true;
+            if (!isset($candidates[$name]['signals'][$signal])) {
+                $candidates[$name]['signals'][$signal] = true;
+                $candidates[$name]['score'] += max(1, $weight);
+            }
             if ($version !== '' && $candidates[$name]['version'] === '') {
                 $candidates[$name]['version'] = $version;
             }
@@ -1847,16 +1849,19 @@ class SecurityScanner
             $addSignal('WordPress', 'HTTP generator/pingback header');
         }
 
-        if (str_contains($lower, '/components/com_') || str_contains($lower, 'option=com_')) {
-            $addSignal('Joomla', 'Joomla component paths');
+        // Joomla: layered multi-signal fingerprint (src/JoomlaFingerprint.php).
+        // Independent signals survive partial hardening — removing one (e.g. the
+        // generator tag) does not blind detection. Each matched signal is fed in
+        // so the strongest CMS still wins the uasort() below.
+        $joomla = JoomlaFingerprint::passiveSignals($bodySample, $headerHints, $generator);
+        if ($joomla['score'] >= JoomlaFingerprint::THRESHOLD_DETECTED) {
+            foreach ($joomla['signals'] as $sig) {
+                $addSignal('Joomla', $sig['label'], $joomla['version'], (int)$sig['weight']);
+            }
         }
-        if (str_contains($lower, '/media/system/') || str_contains($lower, '/templates/system/')) {
-            $addSignal('Joomla', 'Joomla system assets');
-        }
-        if (stripos($generator, 'Joomla') !== false || str_contains($lower, 'joomla')) {
-            $version = preg_match('/Joomla!?\s*([0-9][0-9A-Za-z.\-]*)/i', $generator, $m) ? $m[1] : '';
-            $addSignal('Joomla', $generator !== '' ? 'generator meta tag' : 'Joomla keyword', $version);
-        }
+        // Remember passive strength so the active safety-net probe can decide
+        // whether it needs to run (see probeJoomlaEndpoints()).
+        $this->joomlaPassiveScore = $joomla['score'];
 
         if (str_contains($lower, 'drupal-settings-json') || str_contains($lower, '/core/misc/drupal')) {
             $addSignal('Drupal', 'Drupal frontend assets');
@@ -1883,7 +1888,11 @@ class SecurityScanner
         }
 
         if ($candidates) {
-            uasort($candidates, static fn($a, $b) => count($b['signals']) <=> count($a['signals']));
+            uasort($candidates, static function ($a, $b): int {
+                $byScore = ($b['score'] ?? 0) <=> ($a['score'] ?? 0);
+                if ($byScore !== 0) return $byScore;
+                return count($b['signals']) <=> count($a['signals']);
+            });
             $cms = (string)array_key_first($candidates);
             $version = (string)($candidates[$cms]['version'] ?? '');
             $signals = array_keys($candidates[$cms]['signals']);
@@ -1901,8 +1910,42 @@ class SecurityScanner
                 "CMS: {$display}. Signals: {$detail}.",
                 'Keep CMS, themes, and plugins updated.'
             );
-        } else {
+        } elseif (!$cmsBodyBlocked) {
             $this->addFinding('Technology', 'CMS Detection', 'pass', 'No common CMS fingerprint detected.');
+        }
+
+        // Active safety-net probe. A hardened Joomla site (generator tag + asset
+        // paths stripped) can score 0 passively and be reported as "no CMS" — a
+        // false negative for a site we are meant to protect. Confirm via
+        // Joomla-only endpoints when nothing was detected, or when Joomla was
+        // detected but no version was recovered (probe leaks the exact version
+        // for CVE matching). Skip when another CMS is strongly fingerprinted.
+        $shouldProbe = !$cmsBodyBlocked && (
+            $this->detectedCms === ''
+            || ($this->detectedCms === 'Joomla' && $this->detectedCmsVersion === '')
+        );
+        if ($shouldProbe) {
+            $this->probeJoomlaEndpoints();
+        }
+
+        if ($cmsBodyBlocked && $this->detectedCms === '') {
+            $this->scanBlocked = [
+                'type' => 'captcha_validation',
+                'title' => 'Scan disekat oleh captcha / validation page',
+                'message' => 'Server memulangkan halaman captcha atau user validation, bukan HTML sebenar laman web. Keputusan CMS dan beberapa semakan HTML mungkin tidak lengkap.',
+                'actions' => [
+                    'Allowlist IP/server yang menjalankan SecScan di WAF, load balancer, atau bot protection.',
+                    'Jalankan authenticated scan dengan cookie/session browser yang sudah melepasi captcha.',
+                    'Semak semula selepas validation page dimatikan untuk endpoint scanner atau staging.',
+                ],
+            ];
+            $this->addFinding(
+                'Technology',
+                'CMS Detection Blocked',
+                'warning',
+                'Homepage returned a bot/captcha validation page instead of the real site HTML, so CMS fingerprinting could not inspect the application source.',
+                'Allowlist this scanner at the WAF/load balancer, run an authenticated scan, or provide a validation cookie/session so the scanner receives the same HTML a normal browser sees.'
+            );
         }
 
         $server = $this->getHeader('server') ?? '';
@@ -1928,6 +1971,150 @@ class SecurityScanner
         if ($this->getHeader('x-fastly-request-id')) $cdns[] = 'Fastly';
         if ($this->getHeader('x-azure-ref'))         $cdns[] = 'Azure CDN';
         if ($cdns) $this->addFinding('Technology', 'CDN/WAF', 'pass', 'Detected: ' . implode(', ', $cdns) . '.');
+    }
+
+    private function cmsFingerprintBody(): string
+    {
+        if (strlen($this->responseBody) <= 2500000) {
+            return $this->responseBody;
+        }
+
+        return substr($this->responseBody, 0, 1500000)
+            . "\n<!-- secscan-cms-fingerprint-sample-boundary -->\n"
+            . substr($this->responseBody, -1000000);
+    }
+
+    private function bodyLooksLikeValidationChallenge(string $body): bool
+    {
+        return (bool)preg_match(
+            '/Validation request|User validation required|captcha_resp|captcha\.gif|BNIS_x-bni-jas|Web Page Blocked|browser to have javascript and cookie support enabled/i',
+            $body
+        );
+    }
+
+    private function extractMetaContent(string $html, string $name): string
+    {
+        if (!preg_match_all('/<meta\b[^>]*>/i', $html, $metaTags)) {
+            return '';
+        }
+
+        foreach ($metaTags[0] as $tag) {
+            $attrs = [];
+            if (!preg_match_all('/([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'>`=]+))/i', $tag, $matches, PREG_SET_ORDER)) {
+                continue;
+            }
+            foreach ($matches as $m) {
+                $attrs[strtolower($m[1])] = html_entity_decode(trim($m[2] ?? $m[3] ?? $m[4] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            }
+            if (strcasecmp($attrs['name'] ?? '', $name) === 0) {
+                return trim($attrs['content'] ?? '');
+            }
+        }
+
+        return '';
+    }
+
+    /**
+     * Active safety-net probe for Joomla. Fetches a small set of Joomla-only
+     * endpoints (see JoomlaFingerprint::activeProbePaths()) that survive
+     * front-end hardening, and confirms/upgrades detection from their responses.
+     * Response validation is delegated to the pure JoomlaFingerprint::validateProbe()
+     * so the logic stays unit-testable. Soft-404 / catch-all hosts are guarded
+     * against with matchesBaseline(), same as the other endpoint checks.
+     */
+    private function probeJoomlaEndpoints(): void
+    {
+        $paths = array_keys(JoomlaFingerprint::activeProbePaths());
+        $base  = $this->scheme . '://' . $this->hostname;
+        $mh      = curl_multi_init();
+        $handles = [];
+
+        foreach ($paths as $path) {
+            $ch = curl_init();
+            curl_setopt_array($ch, $this->withAuth([
+                CURLOPT_URL            => $base . $path,
+                CURLOPT_RESOLVE        => $this->pinResolve(),
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT        => 6,
+                CURLOPT_CONNECTTIMEOUT => 4,
+                CURLOPT_FOLLOWLOCATION => false,
+                CURLOPT_USERAGENT      => 'SecScan/2.0',
+                CURLOPT_SSL_VERIFYPEER => false,
+            ]));
+            $handles[$path] = $ch;
+            curl_multi_add_handle($mh, $ch);
+        }
+
+        $running = null;
+        do { curl_multi_exec($mh, $running); curl_multi_select($mh, 0.5); } while ($running > 0);
+
+        $found   = [];   // human-readable labels
+        $score   = 0;
+        $version = '';
+        $note    = '';
+
+        foreach ($handles as $path => $ch) {
+            $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $body = (string)(curl_multi_getcontent($ch) ?? '');
+            curl_multi_remove_handle($mh, $ch);
+            $this->closeCurl($ch);
+
+            // Ignore soft-404 / catch-all bodies to avoid false positives.
+            if ($body !== '' && $this->matchesBaseline($body)) {
+                continue;
+            }
+            $res = JoomlaFingerprint::validateProbe($path, $code, $body);
+            if (!$res['matched']) {
+                continue;
+            }
+            $found[] = $res['label'] . ($res['note'] !== '' ? " ({$res['note']})" : '');
+            $score  += $res['weight'];
+            if ($version === '' && $res['version'] !== '') {
+                $version = $res['version'];
+            }
+            if ($note === '' && $res['note'] !== '') {
+                $note = $res['note'];
+            }
+        }
+        curl_multi_close($mh);
+
+        if ($score < JoomlaFingerprint::THRESHOLD_DETECTED && $version === '') {
+            return; // Not enough active evidence — leave detection unchanged.
+        }
+
+        // Upgrade / confirm detection.
+        $wasHidden = $this->detectedCms === '';
+        $this->detectedCms = 'Joomla';
+        if ($version !== '' && $this->detectedCmsVersion === '') {
+            $this->detectedCmsVersion = $version;
+        }
+        $this->detectedCmsSignals = array_values(array_unique(array_merge($this->detectedCmsSignals, $found)));
+
+        $display = 'Joomla' . ($this->detectedCmsVersion !== '' ? " {$this->detectedCmsVersion}" : '');
+        $detail  = implode(', ', array_slice($found, 0, 3));
+
+        // If the passive layer saw nothing, this is exactly the false-negative
+        // case the probe exists for — flag it as a warning so the operator knows
+        // the site is hardened at the surface but still fingerprintable.
+        if ($wasHidden) {
+            $this->addFinding(
+                'Technology',
+                'CMS Detected (active probe)',
+                'warning',
+                "CMS: {$display}, confirmed via Joomla-only endpoints despite hidden front-end fingerprints. Signals: {$detail}.",
+                'Front-end hardening alone is insufficient. Restrict/remove the leaking endpoints: '
+                . 'block /administrator/manifests/, /language/*/*.xml, README.txt, htaccess.txt, web.config.txt, '
+                . 'and /api/ from public access, then keep core + extensions patched.'
+            );
+        } else {
+            $this->addFinding(
+                'Technology',
+                'Joomla Version Disclosure',
+                $version !== '' ? 'warning' : 'info',
+                "Joomla confirmed via active probe" . ($version !== '' ? " — version {$version} disclosed" : '') . ". Signals: {$detail}.",
+                'Remove version-leaking files (joomla.xml manifest, language XML, README.txt) from public reach.'
+            );
+        }
     }
 
     private function cookieNameExists(string $name): bool
@@ -4069,6 +4256,9 @@ class SecurityScanner
             'detected_cms'    => $this->detectedCms,
             'detected_cms_version' => $this->detectedCmsVersion,
             'detected_cms_signals' => $this->detectedCmsSignals,
+            'scan_blocked'    => $this->scanBlocked !== [],
+            'scan_blocked_type' => (string)($this->scanBlocked['type'] ?? ''),
+            'scan_blocked_detail' => $this->scanBlocked,
             'edge'            => ['cloudflare' => $this->isCloudflareEdge()],
             'tls'             => [
                 'protocol'       => $this->negotiatedTlsProtocol,

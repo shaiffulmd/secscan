@@ -71,6 +71,50 @@ $assert($cms !== null && str_contains($cms->message, 'WordPress'), 'WordPress sh
 $cms = $cmsFindingFor('<a href="/index.php?option=com_content&view=article">Article</a>');
 $assert($cms !== null && str_contains($cms->message, 'Joomla'), 'Joomla should be detected from option=com_ routes.');
 
+$joomlaHead = <<<'HTML'
+<head>
+  <meta name="description" content="My Joomla CMS">
+  <meta name="generator" content="Joomla! - Open Source Content Management">
+  <link href="/media/vendor/awesomplete/css/awesomplete.css?1.1.5" rel="stylesheet">
+  <link href="/components/com_sppagebuilder/assets/css/sppagebuilder.css?143fb2b8" rel="stylesheet">
+  <link href="/cache/com_templates/templates/shaper_educon/c437a894.css" rel="stylesheet">
+  <link href="https://example.edu.my/index.php/component/search/?id=30&amp;Itemid=101&amp;format=opensearch" rel="search" title="Search My Joomla">
+</head>
+HTML;
+$cms = $cmsFindingFor($joomlaHead);
+$assert($cms !== null && str_contains($cms->message, 'Joomla'), 'Joomla should be detected from the supplied Joomla head source.');
+
+$cms = $cmsFindingFor('<html><meta content="Joomla! - Open Source Content Management" name="generator"></html>');
+$assert($cms !== null && str_contains($cms->message, 'Joomla'), 'Joomla generator meta should be detected regardless of attribute order.');
+
+$lateJoomlaScanner = new SecurityScanner('https://8.8.8.8');
+$lateJoomlaBody = str_repeat('<div class="noise">x</div>', 18000)
+    . '<body class="site com-content view-article itemid-101">'
+    . '<link href="/media/templates/site/cassiopeia/css/template.min.css" rel="stylesheet">'
+    . '<script type="application/json" class="joomla-script-options new">{}</script>';
+$ref->getProperty('responseBody')->setValue($lateJoomlaScanner, $lateJoomlaBody);
+$ref->getMethod('checkCMSDetection')->invoke($lateJoomlaScanner);
+$lateJoomlaResult = $ref->getMethod('buildResult')->invoke($lateJoomlaScanner);
+$assertSame('Joomla', $lateJoomlaResult['detected_cms'] ?? null, 'Joomla should be exposed even when source markers appear after the old 300KB sample window.');
+
+$challengeScanner = new SecurityScanner('https://8.8.8.8');
+$challengeBody = '<html><title>Validation request</title><h3>User validation required to continue..</h3>'
+    . '<img src="/captcha.gif"><form action="/captcha_resp"><input name="captcha_resp_txt"></form></html>';
+$ref->getProperty('responseBody')->setValue($challengeScanner, $challengeBody);
+$ref->getMethod('checkCMSDetection')->invoke($challengeScanner);
+$challengeResult = $ref->getMethod('buildResult')->invoke($challengeScanner);
+$challengeTech = $challengeResult['categories']['Technology'] ?? [];
+$assertSame(true, $challengeResult['scan_blocked'] ?? null, 'Captcha/validation pages should set scan_blocked=true.');
+$assertSame('captcha_validation', $challengeResult['scan_blocked_type'] ?? null, 'Captcha/validation pages should expose the blocked type.');
+$assert(
+    (bool)array_filter($challengeTech, fn($f) => ($f['check'] ?? '') === 'CMS Detection Blocked'),
+    'Captcha/validation pages should be reported as blocked CMS detection.'
+);
+$assert(
+    !(bool)array_filter($challengeTech, fn($f) => ($f['check'] ?? '') === 'CMS Detection' && ($f['severity'] ?? '') === 'pass'),
+    'Captcha/validation pages should not produce a false "No common CMS" pass.'
+);
+
 $cms = $cmsFindingFor('<script type="application/json" data-drupal-selector="drupal-settings-json">{}</script>');
 $assert($cms !== null && str_contains($cms->message, 'Drupal'), 'Drupal should be detected from drupal-settings-json.');
 

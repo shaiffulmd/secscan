@@ -25,11 +25,42 @@
 
   document.addEventListener('DOMContentLoaded', function () {
     var btn = document.getElementById('themeToggle');
-    if (!btn) return;
-    btn.addEventListener('click', function () {
-      var next = effective() === 'dark' ? 'light' : 'dark';
-      try { localStorage.setItem(KEY, next); } catch (_) {}
-      apply(next);
-    });
+    if (btn) {
+      btn.addEventListener('click', function () {
+        var next = effective() === 'dark' ? 'light' : 'dark';
+        try { localStorage.setItem(KEY, next); } catch (_) {}
+        apply(next);
+      });
+    }
+
+    var copyBtn = document.getElementById('saCopyBtn');
+    var curl = document.getElementById('saCurl');
+    if (copyBtn && curl) {
+      copyBtn.addEventListener('click', function () {
+        var text = curl.textContent.trim();
+        var done = function () {
+          copyBtn.textContent = 'Disalin';
+          copyBtn.classList.add('copied');
+          setTimeout(function () {
+            copyBtn.textContent = 'Salin';
+            copyBtn.classList.remove('copied');
+          }, 1800);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done).catch(fallback);
+        } else {
+          fallback();
+        }
+        function fallback() {
+          var r = document.createRange();
+          r.selectNodeContents(curl);
+          var s = window.getSelection();
+          s.removeAllRanges();
+          s.addRange(r);
+          try { document.execCommand('copy'); done(); } catch (_) {}
+          s.removeAllRanges();
+        }
+      });
+    }
   });
 })();
