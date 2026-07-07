@@ -16,7 +16,7 @@ DirectoryIndex index.php
 # Note: each alternative is matched anywhere in the name so timestamped
 # backups like "scanner.php.bak.20260612120212" are also caught.
 # ----------------------------------------------------------------
-<FilesMatch "(\.bak|\.backup|\.old|\.orig|\.swp|\.tmp|\.db|\.sqlite|\.sqlite3|\.sql|\.log|\.env|\.ini|\.lock)(\.|$)">
+<FilesMatch "(\.bak|\.backup|\.old|\.orig|\.swp|\.tmp|\.db|\.sqlite|\.sqlite3|\.sql|\.log|\.env|\.ini|\.lock|\.zip)(\.|$)">
     Require all denied
 </FilesMatch>
 

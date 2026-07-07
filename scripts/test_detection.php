@@ -166,6 +166,7 @@ $ref        = new ReflectionClass('SecurityScanner');
 $pAuthHead  = $ref->getProperty('authHeaders');
 $pAuthCook  = $ref->getProperty('authCookie');
 $pAuthOn    = $ref->getProperty('authEnabled');
+$pHost      = $ref->getProperty('hostname');
 $mWithAuth  = $ref->getMethod('withAuth');
 
 // (a) Allow-list: Authorization + X-* kept; disallowed header dropped.
@@ -191,12 +192,19 @@ check('strips CR/LF from header values', strpos($joined, "\r") === false && strp
 
 // (d) withAuth() merges into cURL opts and preserves existing headers.
 $s4 = $ref->newInstanceWithoutConstructor();
+$pHost->setValue($s4, 'secure.example.test');
 $s4->setAuth(['Authorization: Bearer t'], 'sid=9');
-$opts = $mWithAuth->invoke($s4, [CURLOPT_HTTPHEADER => ['Content-Type: application/json']]);
+$opts = $mWithAuth->invoke($s4, [
+    CURLOPT_URL => 'https://secure.example.test/api',
+    CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+]);
 check('withAuth sets CURLOPT_COOKIE', ($opts[CURLOPT_COOKIE] ?? '') === 'sid=9');
 check('withAuth preserves caller headers + adds auth',
     in_array('Content-Type: application/json', $opts[CURLOPT_HTTPHEADER], true)
     && in_array('Authorization: Bearer t', $opts[CURLOPT_HTTPHEADER], true));
+$crossHost = $mWithAuth->invoke($s4, [CURLOPT_URL => 'https://redirected.example.test/api']);
+check('withAuth skips credentials for redirected host',
+    !isset($crossHost[CURLOPT_COOKIE]) && !isset($crossHost[CURLOPT_HTTPHEADER]));
 
 // (e) No auth configured -> withAuth is a no-op.
 $s5 = $ref->newInstanceWithoutConstructor();

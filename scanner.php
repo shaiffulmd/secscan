@@ -81,6 +81,7 @@ class SecurityScanner
     private array $authHeaders = [];   // ['Authorization: Bearer …', 'X-Api-Key: …']
     private string $authCookie = '';    // raw Cookie header value, e.g. 'sid=abc; csrf=xyz'
     private bool $authEnabled = false;
+    private string $authOriginHost = '';
 
     private const WEAK_CIPHERS = [
         'RC4', 'DES-CBC', '3DES', 'DES-CBC3', 'NULL',
@@ -130,9 +131,8 @@ class SecurityScanner
      * map. Only a safe subset is honoured (Authorization, Cookie, and any X-*
      * header); everything else is dropped. CR/LF is stripped to prevent header
      * injection. Any 'Cookie' header is merged into the cookie jar. These
-     * credentials are sent ONLY to the original target host — see withAuth()
-     * and the same-host guard in fetchUrl() — so tokens never leak on a
-     * cross-host redirect.
+     * credentials are sent ONLY to the original target host — withAuth()
+     * checks each request URL so tokens never leak after a cross-host redirect.
      *
      * @param array<int|string,string> $headers
      */
@@ -167,6 +167,7 @@ class SecurityScanner
         $this->authHeaders = $safe;
         $this->authCookie  = implode('; ', $cookieParts);
         $this->authEnabled = !empty($this->authHeaders) || $this->authCookie !== '';
+        $this->authOriginHost = isset($this->hostname) ? strtolower(trim($this->hostname, '[]')) : '';
     }
 
     /** Allow-list of request headers that are meaningful for an authenticated scan. */
@@ -191,6 +192,7 @@ class SecurityScanner
     private function withAuth(array $opts): array
     {
         if (!$this->authEnabled) return $opts;
+        if (!$this->authRequestMatchesOrigin($opts)) return $opts;
         if ($this->authCookie !== '') {
             $opts[CURLOPT_COOKIE] = $this->authCookie;
         }
@@ -199,6 +201,25 @@ class SecurityScanner
             $opts[CURLOPT_HTTPHEADER] = array_merge($existing, $this->authHeaders);
         }
         return $opts;
+    }
+
+    private function authRequestMatchesOrigin(array $opts): bool
+    {
+        if ($this->authOriginHost === '') {
+            return true;
+        }
+
+        $url = (string)($opts[CURLOPT_URL] ?? '');
+        if ($url === '') {
+            return false;
+        }
+
+        $host = parse_url($url, PHP_URL_HOST);
+        if (!is_string($host) || $host === '') {
+            return false;
+        }
+
+        return strcasecmp(trim($host, '[]'), $this->authOriginHost) === 0;
     }
 
     /**
