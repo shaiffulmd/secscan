@@ -54,8 +54,8 @@ line();
 $scanner = new SecurityScanner($target);
 $ref     = new ReflectionClass($scanner);
 
-$mGetBaseline = $ref->getMethod('getBaseline');     $mGetBaseline->setAccessible(true);
-$mMatches     = $ref->getMethod('matchesBaseline'); $mMatches->setAccessible(true);
+$mGetBaseline = $ref->getMethod('getBaseline');
+$mMatches     = $ref->getMethod('matchesBaseline');
 
 $baseline = $mGetBaseline->invoke($scanner);
 

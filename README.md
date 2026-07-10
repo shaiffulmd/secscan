@@ -8,6 +8,11 @@ SecScan is a PHP-based web security scanner with a public scan UI, JSON API, SQL
 - PHP extensions: `curl`, `openssl`, `pdo`, `pdo_sqlite`
 - Optional: `dig` for deeper DNSSEC/CAA checks
 
+## Versioning
+
+Update the root `VERSION` file for every release. The value is displayed in the
+scanner footer and dashboard; `SECSCAN_APP_VERSION` may override it per deployment.
+
 ## Local Run
 
 ```sh
@@ -25,6 +30,18 @@ Set these environment variables before deployment:
 - `SECSCAN_DATA_DIR`
 - `SECSCAN_DB_PATH`
 
+Request JSON dihadkan melalui `SECSCAN_MAX_REQUEST_BYTES` (lalai 64 KiB). UI
+dan `api.php` berkongsi kuota scan yang sama (`SECSCAN_SCAN_RATE_LIMIT` /
+`SECSCAN_SCAN_RATE_WINDOW`), jadi kuota tidak boleh dipintas dengan menukar endpoint.
+
+## GeoIP country map
+
+The dashboard can download the monthly DB-IP Lite country CSV from its GeoIP
+panel, then backfill existing scan records and classify new scan IPs locally.
+Country-level data is shown only to dashboard administrators. DB-IP Lite is
+published under CC BY 4.0, so the dashboard includes the required attribution.
+Set `SECSCAN_GEOIP_UPDATE_URL` only when you need an approved HTTPS mirror.
+
 ### Running behind a proxy or CDN
 
 Forwarded client-IP headers (`CF-Connecting-IP`, `X-Real-IP`, `X-Forwarded-For`)
@@ -38,6 +55,16 @@ and the dashboard's unique-IP counts will be wrong:
 
 Without one of these set, all traffic behind a proxy appears to come from the
 proxy's IP and shares a single rate-limit bucket.
+
+### Scanner allowlist identity
+
+Set these so users can allowlist the SecScan server in their WAF/firewall before
+starting a scan. The allowlist panel appears only when at least one of these
+values is configured:
+
+- `SECSCAN_SCANNER_PUBLIC_DOMAIN` — public scanner hostname shown in the UI.
+- `SECSCAN_SCANNER_PUBLIC_IPS` — outbound/NAT IPs used by the scanner server,
+  comma-separated.
 
 Generate a dashboard password hash with:
 
@@ -84,8 +111,9 @@ It is **off by default on purpose** — a public, unauthenticated endpoint that
 forwards arbitrary credentials to arbitrary hosts is an abuse vector. Only
 enable it on an access-controlled deployment.
 
-Credentials are sent **only to the original target host** (never across a
-redirect to a different host), and only a safe subset of headers is honoured:
+Credentials are sent **only to the original HTTPS origin** (same scheme, host,
+and effective port; never across a redirect), and only a safe subset of headers
+is honoured:
 `Authorization`, `Cookie`, and any `X-*` header. CR/LF is stripped to prevent
 header injection. When credentials are supplied, the result JSON includes
 `"authenticated": true`.

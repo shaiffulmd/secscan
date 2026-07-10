@@ -37,6 +37,9 @@ class SecurityScanner
     private array $responseHeaders = [];
     private string $responseBody = '';
     private array $cookies = [];
+    private array $primaryResponseHeaders = [];
+    private string $primaryResponseBody = '';
+    private array $primaryCookies = [];
     private int $httpCode = 0;
     private float $scanStart;
     private array $resolvedIpv4 = [];
@@ -61,6 +64,8 @@ class SecurityScanner
     private string $detectedCmsVersion = '';
     private array $detectedCmsSignals = [];
     private array $scanBlocked = [];
+    private array $detectedWafVendors = [];
+    private array $detectedWafSignals = [];
 
     // Weighted score from the passive Joomla fingerprint layer. Drives the
     // active safety-net probe: a hardened Joomla site can score 0 passively,
@@ -81,7 +86,7 @@ class SecurityScanner
     private array $authHeaders = [];   // ['Authorization: Bearer …', 'X-Api-Key: …']
     private string $authCookie = '';    // raw Cookie header value, e.g. 'sid=abc; csrf=xyz'
     private bool $authEnabled = false;
-    private string $authOriginHost = '';
+    private string $authOrigin = '';
 
     private const WEAK_CIPHERS = [
         'RC4', 'DES-CBC', '3DES', 'DES-CBC3', 'NULL',
@@ -92,6 +97,7 @@ class SecurityScanner
     private const STRONG_KEY_EXCHANGES = ['ECDHE', 'DHE', 'X25519', 'X448', 'CECPQ'];
     private const STRONG_AEAD_CIPHERS  = ['GCM', 'CHACHA20', 'POLY1305', 'CCM'];
     private const PFS_CIPHERS          = ['ECDHE', 'DHE', 'ECDH'];
+    private const TARGET_USER_AGENT    = 'Mozilla/5.0 (compatible; SecScan/2.0; +https://security.apasaja.my)';
 
     public function __construct(string $url)
     {
@@ -167,7 +173,13 @@ class SecurityScanner
         $this->authHeaders = $safe;
         $this->authCookie  = implode('; ', $cookieParts);
         $this->authEnabled = !empty($this->authHeaders) || $this->authCookie !== '';
-        $this->authOriginHost = isset($this->hostname) ? strtolower(trim($this->hostname, '[]')) : '';
+        $this->authOrigin = $this->originForUrl(isset($this->url) ? $this->url : '');
+        // Supports isolated unit tests that instantiate without the constructor.
+        if ($this->authOrigin === '' && isset($this->hostname)) {
+            $scheme = isset($this->scheme) ? $this->scheme : 'https';
+            $port = isset($this->port) ? $this->port : (strtolower($scheme) === 'https' ? 443 : 80);
+            $this->authOrigin = $this->formatOrigin($scheme, $this->hostname, $port);
+        }
     }
 
     /** Allow-list of request headers that are meaningful for an authenticated scan. */
@@ -185,7 +197,7 @@ class SecurityScanner
 
     /**
      * Merge authenticated-scan credentials into a cURL option array. Callers
-     * wrap their per-request option array with this so every same-host target
+     * wrap their per-request option array with this so every same-origin target
      * request carries the session. Preserves any CURLOPT_HTTPHEADER the caller
      * already set (e.g. Origin/Content-Type probes).
      */
@@ -193,6 +205,13 @@ class SecurityScanner
     {
         if (!$this->authEnabled) return $opts;
         if (!$this->authRequestMatchesOrigin($opts)) return $opts;
+        // Session credentials must never travel over plaintext HTTP or a TLS
+        // connection whose certificate is not verified. This intentionally
+        // overrides permissive probe defaults used for anonymous scans.
+        $scheme = strtolower((string)parse_url((string)$opts[CURLOPT_URL], PHP_URL_SCHEME));
+        if ($scheme !== 'https') return $opts;
+        $opts[CURLOPT_SSL_VERIFYPEER] = true;
+        $opts[CURLOPT_SSL_VERIFYHOST] = 2;
         if ($this->authCookie !== '') {
             $opts[CURLOPT_COOKIE] = $this->authCookie;
         }
@@ -205,21 +224,9 @@ class SecurityScanner
 
     private function authRequestMatchesOrigin(array $opts): bool
     {
-        if ($this->authOriginHost === '') {
-            return true;
-        }
-
         $url = (string)($opts[CURLOPT_URL] ?? '');
-        if ($url === '') {
-            return false;
-        }
-
-        $host = parse_url($url, PHP_URL_HOST);
-        if (!is_string($host) || $host === '') {
-            return false;
-        }
-
-        return strcasecmp(trim($host, '[]'), $this->authOriginHost) === 0;
+        return $url !== '' && $this->authOrigin !== ''
+            && hash_equals($this->authOrigin, $this->originForUrl($url));
     }
 
     /**
@@ -337,6 +344,31 @@ class SecurityScanner
         return strtolower($scheme) === 'https' ? 443 : 80;
     }
 
+    /** Canonical scheme/host/effective-port tuple used for auth and probes. */
+    private function originForUrl(string $url): string
+    {
+        $scheme = strtolower((string)parse_url($url, PHP_URL_SCHEME));
+        $host = (string)parse_url($url, PHP_URL_HOST);
+        if ($scheme === '' || $host === '' || !in_array($scheme, ['http', 'https'], true)) {
+            return '';
+        }
+        return $this->formatOrigin($scheme, $host, $this->portForUrl($url, $scheme));
+    }
+
+    private function formatOrigin(string $scheme, string $host, int $port): string
+    {
+        $host = strtolower(trim($host, '[]'));
+        if ($host === '' || $port < 1 || $port > 65535) return '';
+        $authority = str_contains($host, ':') ? '[' . $host . ']' : $host;
+        return strtolower($scheme) . '://' . $authority . ':' . $port;
+    }
+
+    /** Base URL for target-relative probes; preserves a non-default port. */
+    private function originBase(): string
+    {
+        return $this->formatOrigin($this->scheme, $this->hostname, $this->port);
+    }
+
     private function applyValidatedTarget(string $url, array $target): void
     {
         $this->url = rtrim($url, '/');
@@ -409,6 +441,7 @@ class SecurityScanner
             'checkECDHESupport', 'checkPerfectForwardSecrecy', 'checkCertificateChain',
             'checkCORS', 'checkCORSReflection', 'checkCrossDomainPolicy',
             'checkMixedContent', 'checkSRI', 'checkInsecureForms', 'checkMetaCSP',
+            'checkClientSideDependencies',
             'checkCsrfProtection',
             'checkExposedSecrets',
             'checkHTTPVersions',
@@ -418,6 +451,7 @@ class SecurityScanner
             'checkApiGraphQL',
             'checkCMSDetection',
             'checkCMSVulnerabilities',
+            'checkCmsHardening',
             'checkWAF',
             'checkOutdatedSoftware',
             'checkSubdomainTakeover',
@@ -504,9 +538,10 @@ class SecurityScanner
                 CURLOPT_FOLLOWLOCATION => false,
                 CURLOPT_TIMEOUT        => 20,
                 CURLOPT_CONNECTTIMEOUT => 10,
-                CURLOPT_USERAGENT      => 'SecScan/2.0 Security Scanner',
+                CURLOPT_USERAGENT      => self::TARGET_USER_AGENT,
                 CURLOPT_SSL_VERIFYPEER => true,
                 CURLOPT_SSL_VERIFYHOST => 2,
+                CURLOPT_HTTP_VERSION   => CURL_HTTP_VERSION_1_1,
                 CURLOPT_ENCODING       => '',
                 CURLOPT_HEADERFUNCTION => function ($ch, $header) use (&$headers) {
                     $len = strlen($header);
@@ -552,9 +587,20 @@ class SecurityScanner
 
             if ($body === false || $this->httpCode === 0) {
                 $msg = $error ?: "cURL error #{$errno}";
+                $recommendation = 'Verify the URL is correct and the server is running.';
+                $this->applyWafOverride('reachability_failure', $msg);
+                if (
+                    $errno === 60
+                    || stripos($msg, 'SSL certificate') !== false
+                    || stripos($msg, 'unable to get local issuer certificate') !== false
+                    || stripos($msg, 'unable to verify the first certificate') !== false
+                ) {
+                    $recommendation = 'Server is reachable, but the TLS certificate chain is incomplete or untrusted. Install the missing intermediate CA certificate on the web server, then scan again.';
+                }
                 $this->addFinding('Connection', 'Reachability', 'critical',
                     "Could not connect to {$currentUrl}: {$msg}",
-                    'Verify the URL is correct and the server is running.');
+                    $recommendation);
+                $this->capturePassiveCmsAfterFetchFailure($currentUrl, $target, $msg);
                 return false;
             }
 
@@ -574,6 +620,9 @@ class SecurityScanner
             $this->applyValidatedTarget($currentUrl, $target);
             $this->responseHeaders = $headers;
             $this->responseBody    = (string)$body;
+            $this->primaryResponseHeaders = $headers;
+            $this->primaryResponseBody = (string)$body;
+            $this->primaryCookies = $this->cookies;
             $this->addFinding('Connection', 'Reachability', 'pass', "Successfully connected — HTTP {$this->httpCode}.");
             return true;
         }
@@ -970,7 +1019,7 @@ class SecurityScanner
             CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_TIMEOUT        => 8,
             CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_USERAGENT      => 'SecScan/2.0',
+            CURLOPT_USERAGENT => self::TARGET_USER_AGENT,
             CURLOPT_NOBODY         => true,
             CURLOPT_HEADER         => true,
         ]);
@@ -1447,6 +1496,69 @@ class SecurityScanner
         }
     }
 
+    /**
+     * Identify a small set of high-confidence JavaScript library/version pairs
+     * from the delivered HTML. This is intentionally passive: it never fetches
+     * third-party assets or claims an unversioned library is vulnerable.
+     *
+     * @return array<int,array{name:string,version:string,severity:string,note:string}>
+     */
+    public function analyzeClientSideDependencies(string $html): array
+    {
+        $sample = substr(html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8'), 0, 500000);
+        $patterns = [
+            'jQuery' => '/(?:jquery(?:[-.]?(?:min|slim))?[-.]?v?|jquery\.js\?[^"\'\s>]*(?:ver|version)=)(\d+\.\d+(?:\.\d+)?)/i',
+            'Lodash' => '/(?:lodash(?:\.min)?[-.]?v?|lodash\.js\?[^"\'\s>]*(?:ver|version)=)(\d+\.\d+(?:\.\d+)?)/i',
+            'Bootstrap' => '/(?:bootstrap(?:\.bundle|\.min)?[-.]?v?|bootstrap(?:\.min)?\.css\?[^"\'\s>]*(?:ver|version)=)(\d+\.\d+(?:\.\d+)?)/i',
+            'AngularJS' => '/(?:angular(?:\.min)?[-.]?v?|angular\.js\?[^"\'\s>]*(?:ver|version)=)(\d+\.\d+(?:\.\d+)?)/i',
+        ];
+
+        $out = [];
+        foreach ($patterns as $name => $pattern) {
+            if (!preg_match_all($pattern, $sample, $matches)) continue;
+            foreach (array_values(array_unique($matches[1])) as $version) {
+                $severity = '';
+                $note = '';
+                if ($name === 'jQuery' && version_compare($version, '3.5.0', '<')) {
+                    $severity = 'warning';
+                    $note = 'Known cross-site scripting fixes are missing in jQuery versions before 3.5.0.';
+                } elseif ($name === 'Lodash' && version_compare($version, '4.17.21', '<')) {
+                    $severity = 'critical';
+                    $note = 'Known prototype-pollution and command-injection fixes are missing before Lodash 4.17.21.';
+                } elseif ($name === 'Bootstrap' && (version_compare($version, '3.4.1', '<') || (str_starts_with($version, '4.') && version_compare($version, '4.3.1', '<')))) {
+                    $severity = 'warning';
+                    $note = 'Known cross-site scripting fixes are missing in this Bootstrap version.';
+                } elseif ($name === 'AngularJS' && str_starts_with($version, '1.')) {
+                    $severity = 'info';
+                    $note = 'AngularJS is end-of-life; migrate to a supported framework.';
+                }
+                if ($severity !== '') {
+                    $out["{$name}|{$version}"] = compact('name', 'version', 'severity', 'note');
+                }
+            }
+        }
+
+        return array_values($out);
+    }
+
+    private function checkClientSideDependencies(): void
+    {
+        if (!$this->isHTML()) return;
+        $hits = $this->analyzeClientSideDependencies($this->responseBody);
+        if ($hits === []) {
+            $this->addFinding('Technology', 'Client-side Dependency CVE', 'pass',
+                'No high-confidence vulnerable JavaScript library version was fingerprinted from the delivered HTML.');
+            return;
+        }
+
+        foreach ($hits as $hit) {
+            $this->addFinding('Technology', "{$hit['name']} {$hit['version']}", $hit['severity'],
+                $hit['note'],
+                "Upgrade {$hit['name']} to a supported patched release, then verify the deployed asset version.",
+                ['https://owasp.org/www-project-top-ten/2017/A9_2017-Using_Components_with_Known_Vulnerabilities']);
+        }
+    }
+
     private function checkInsecureForms(): void
     {
         if (!$this->isHTML()) return;
@@ -1630,7 +1742,7 @@ class SecurityScanner
     private function checkHTTPVersions(): void
     {
         $ch = curl_init();
-        curl_setopt_array($ch, [CURLOPT_URL => $this->url, CURLOPT_RESOLVE => $this->pinResolve(), CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 10, CURLOPT_CONNECTTIMEOUT => 8, CURLOPT_USERAGENT => 'SecScan/2.0', CURLOPT_SSL_VERIFYPEER => false, CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_2_0]);
+        curl_setopt_array($ch, [CURLOPT_URL => $this->url, CURLOPT_RESOLVE => $this->pinResolve(), CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 10, CURLOPT_CONNECTTIMEOUT => 8, CURLOPT_USERAGENT => self::TARGET_USER_AGENT, CURLOPT_SSL_VERIFYPEER => false, CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_2_0]);
         curl_exec($ch);
         $ver = curl_getinfo($ch, CURLINFO_HTTP_VERSION);
         $this->closeCurl($ch);
@@ -1853,21 +1965,40 @@ class SecurityScanner
             }
         };
 
-        if (str_contains($lower, 'wp-content/') || str_contains($lower, 'wp-includes/')) {
-            $addSignal('WordPress', 'WordPress asset paths');
+        $cookieHints = strtolower(implode(' ', $this->cookies));
+        $wpVersion = $this->detectWordPressVersion($bodySample, $headerHints);
+
+        if (
+            str_contains($lower, 'wp-includes/')
+            || preg_match('#/wp-content/(?:themes|plugins|mu-plugins)/#i', $bodySample)
+        ) {
+            $addSignal('WordPress', 'WordPress asset paths', $wpVersion, 4);
         }
-        if (str_contains($lower, 'wp-json') || str_contains($headerHints, 'api.w.org')) {
-            $addSignal('WordPress', 'WordPress REST API link');
+        if (
+            str_contains($lower, 'wp-json')
+            || str_contains($headerHints, 'api.w.org')
+            || str_contains($headerHints, 'wp-json/oembed')
+        ) {
+            $addSignal('WordPress', 'WordPress REST API link', $wpVersion);
         }
         if (str_contains($lower, 'wp-emoji-release') || str_contains($lower, 'wp-block-library')) {
-            $addSignal('WordPress', 'WordPress core frontend assets');
+            $addSignal('WordPress', 'WordPress core frontend assets', $wpVersion);
+        }
+        if (preg_match('#/wp-includes/(?:css|js|blocks)/#i', $bodySample)) {
+            $addSignal('WordPress', 'WordPress core asset paths', $wpVersion);
+        }
+        if (
+            str_contains($cookieHints, 'pll_language=')
+            || preg_match('/\bwordpress_(?:logged_in|sec|test_cookie)|\bwp-settings-\d+=|\bwp_lang=/i', $cookieHints)
+        ) {
+            $addSignal('WordPress', 'WordPress cookie/plugin marker', $wpVersion, 4);
         }
         if (stripos($generator, 'WordPress') !== false) {
-            $version = preg_match('/WordPress\s*([0-9][0-9A-Za-z.\-]*)/i', $generator, $m) ? $m[1] : '';
+            $version = preg_match('/WordPress\s*([0-9][0-9A-Za-z.\-]*)/i', $generator, $m) ? $m[1] : $wpVersion;
             $addSignal('WordPress', 'generator meta tag', $version);
         }
         if (str_contains($headerHints, 'wordpress')) {
-            $addSignal('WordPress', 'HTTP generator/pingback header');
+            $addSignal('WordPress', 'HTTP generator/pingback header', $wpVersion);
         }
 
         // Joomla: layered multi-signal fingerprint (src/JoomlaFingerprint.php).
@@ -1996,13 +2127,226 @@ class SecurityScanner
 
     private function cmsFingerprintBody(): string
     {
-        if (strlen($this->responseBody) <= 2500000) {
-            return $this->responseBody;
+        return $this->cmsFingerprintSample($this->responseBody);
+    }
+
+    private function cmsFingerprintSample(string $body): string
+    {
+        if (strlen($body) <= 2500000) {
+            return $body;
         }
 
-        return substr($this->responseBody, 0, 1500000)
+        return substr($body, 0, 1500000)
             . "\n<!-- secscan-cms-fingerprint-sample-boundary -->\n"
-            . substr($this->responseBody, -1000000);
+            . substr($body, -1000000);
+    }
+
+    private function detectWordPressVersion(string $html, string $headerHints = ''): string
+    {
+        foreach ([$html, $headerHints] as $source) {
+            if (preg_match('/WordPress\s*([0-9][0-9A-Za-z.\-]*)/i', $source, $m)) {
+                return $m[1];
+            }
+        }
+
+        $coreVersionAssets = [
+            '#wp-includes/js/wp-emoji-(?:release|loader)(?:\.min)?\.js[^"\'<>\s]*[?&](?:amp;)?ver=([0-9][0-9A-Za-z.\-]*)#i',
+            '#wp-includes/css/(?:dashicons|classic-themes)(?:\.min)?\.css[^"\'<>\s]*[?&](?:amp;)?ver=([0-9][0-9A-Za-z.\-]*)#i',
+            '#wp-includes/(?:blocks/[^"\'<>\s?]+/style(?:\.min)?\.css|css/dist/block-library/style(?:\.min)?\.css)[^"\'<>\s]*[?&](?:amp;)?ver=([0-9][0-9A-Za-z.\-]*)#i',
+        ];
+        foreach ($coreVersionAssets as $pattern) {
+            if (preg_match_all($pattern, $html, $matches)) {
+                foreach ($matches[1] as $candidate) {
+                    if (preg_match('/^\d+(?:\.\d+){1,3}(?:[-.][A-Za-z0-9]+)?$/', $candidate)) {
+                        return $candidate;
+                    }
+                }
+            }
+        }
+
+        return '';
+    }
+
+    private function passiveCmsSnapshot(string $body, array $headers = [], array $cookies = []): array
+    {
+        $bodySample = str_replace('\\/', '/', $this->cmsFingerprintSample($body));
+        $lower = strtolower($bodySample);
+        $headerHints = strtolower(implode(' ', array_filter(array_merge(
+            $headers['link'] ?? [],
+            $headers['x-generator'] ?? [],
+            $headers['x-drupal-cache'] ?? [],
+            $headers['x-pingback'] ?? []
+        ))));
+        $cookieHints = strtolower(implode(' ', $cookies));
+        $generator = $this->extractMetaContent($bodySample, 'generator');
+        $wpVersion = $this->detectWordPressVersion($bodySample, $headerHints);
+
+        $candidates = [];
+        $addSignal = static function (string $name, string $signal, string $version = '', int $weight = 3) use (&$candidates): void {
+            if (!isset($candidates[$name])) {
+                $candidates[$name] = ['signals' => [], 'version' => '', 'score' => 0];
+            }
+            if (!isset($candidates[$name]['signals'][$signal])) {
+                $candidates[$name]['signals'][$signal] = true;
+                $candidates[$name]['score'] += max(1, $weight);
+            }
+            if ($version !== '' && $candidates[$name]['version'] === '') {
+                $candidates[$name]['version'] = $version;
+            }
+        };
+
+        if (
+            str_contains($lower, 'wp-includes/')
+            || preg_match('#/wp-content/(?:themes|plugins|mu-plugins)/#i', $bodySample)
+        ) {
+            $addSignal('WordPress', 'WordPress asset paths', $wpVersion, 4);
+        }
+        if (
+            str_contains($lower, 'wp-json')
+            || str_contains($headerHints, 'api.w.org')
+            || str_contains($headerHints, 'wp-json/oembed')
+        ) {
+            $addSignal('WordPress', 'WordPress REST API link', $wpVersion);
+        }
+        if (str_contains($lower, 'wp-emoji-release') || str_contains($lower, 'wp-block-library')) {
+            $addSignal('WordPress', 'WordPress core frontend assets', $wpVersion);
+        }
+        if (preg_match('#/wp-includes/(?:css|js|blocks)/#i', $bodySample)) {
+            $addSignal('WordPress', 'WordPress core asset paths', $wpVersion);
+        }
+        if (
+            str_contains($cookieHints, 'pll_language=')
+            || preg_match('/\bwordpress_(?:logged_in|sec|test_cookie)|\bwp-settings-\d+=|\bwp_lang=/i', $cookieHints)
+        ) {
+            $addSignal('WordPress', 'WordPress cookie/plugin marker', $wpVersion, 4);
+        }
+        if (stripos($generator, 'WordPress') !== false) {
+            $version = preg_match('/WordPress\s*([0-9][0-9A-Za-z.\-]*)/i', $generator, $m) ? $m[1] : $wpVersion;
+            $addSignal('WordPress', 'generator meta tag', $version);
+        }
+        if (str_contains($headerHints, 'wordpress')) {
+            $addSignal('WordPress', 'HTTP generator/pingback header', $wpVersion);
+        }
+
+        $joomla = JoomlaFingerprint::passiveSignals($bodySample, $headerHints, $generator);
+        if ($joomla['score'] >= JoomlaFingerprint::THRESHOLD_DETECTED) {
+            foreach ($joomla['signals'] as $sig) {
+                $addSignal('Joomla', $sig['label'], $joomla['version'], (int)$sig['weight']);
+            }
+        }
+
+        if (str_contains($lower, 'drupal-settings-json') || str_contains($lower, '/core/misc/drupal')) {
+            $addSignal('Drupal', 'Drupal frontend assets');
+        }
+        if (str_contains($lower, '/sites/default/files') || str_contains($lower, '/sites/all/')) {
+            $addSignal('Drupal', 'Drupal site file paths');
+        }
+        if (stripos($generator, 'Drupal') !== false || str_contains($headerHints, 'drupal')) {
+            $version = preg_match('/Drupal\s*([0-9][0-9A-Za-z.\-]*)/i', $generator, $m) ? $m[1] : '';
+            $addSignal('Drupal', $generator !== '' ? 'generator meta/header' : 'HTTP generator header', $version);
+        }
+
+        if (str_contains($lower, 'cdn.shopify.com') || str_contains($lower, 'shopify-section')) {
+            $addSignal('Shopify', 'Shopify storefront assets');
+        }
+        if (str_contains($lower, 'wix.com') || str_contains($lower, 'wixstatic.com')) {
+            $addSignal('Wix', 'Wix assets');
+        }
+        if (str_contains($lower, 'squarespace') || str_contains($lower, 'static1.squarespace.com')) {
+            $addSignal('Squarespace', 'Squarespace assets');
+        }
+        if (str_contains($lower, 'ghost-') || str_contains($lower, 'ghost/api/')) {
+            $addSignal('Ghost', 'Ghost assets/API');
+        }
+
+        if (!$candidates) {
+            return ['cms' => '', 'version' => '', 'signals' => [], 'joomla_score' => $joomla['score']];
+        }
+
+        uasort($candidates, static function ($a, $b): int {
+            $byScore = ($b['score'] ?? 0) <=> ($a['score'] ?? 0);
+            if ($byScore !== 0) return $byScore;
+            return count($b['signals']) <=> count($a['signals']);
+        });
+
+        $cms = (string)array_key_first($candidates);
+        return [
+            'cms' => $cms,
+            'version' => (string)($candidates[$cms]['version'] ?? ''),
+            'signals' => array_keys($candidates[$cms]['signals']),
+            'joomla_score' => $joomla['score'],
+        ];
+    }
+
+    private function capturePassiveCmsAfterFetchFailure(string $url, array $target, string $reason): void
+    {
+        if ($this->detectedCms !== '') {
+            return;
+        }
+
+        $headers = [];
+        $cookies = [];
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL => $url,
+            CURLOPT_RESOLVE => $this->pinResolveForHost(
+                (string)($target['hostname'] ?? $this->hostname),
+                $this->portForUrl($url, (string)($target['scheme'] ?? $this->scheme)),
+                $target['ipv4'] ?? [],
+                $target['ipv6'] ?? [],
+                [80, 443]
+            ),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 8,
+            CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_USERAGENT => self::TARGET_USER_AGENT,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => 0,
+            CURLOPT_ENCODING => '',
+            CURLOPT_HEADERFUNCTION => static function ($ch, $header) use (&$headers, &$cookies) {
+                $len = strlen($header);
+                $parts = explode(':', $header, 2);
+                if (count($parts) === 2) {
+                    $name = strtolower(trim($parts[0]));
+                    $value = trim($parts[1]);
+                    $headers[$name][] = $value;
+                }
+                if (stripos($header, 'Set-Cookie:') === 0) {
+                    $cookies[] = trim(substr($header, 11));
+                }
+                return $len;
+            },
+        ]);
+
+        $body = curl_exec($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $this->closeCurl($ch);
+
+        if ($body === false || $code < 200 || $code >= 400) {
+            return;
+        }
+
+        $snapshot = $this->passiveCmsSnapshot((string)$body, $headers, $cookies);
+        if (($snapshot['cms'] ?? '') === '') {
+            return;
+        }
+
+        $this->detectedCms = (string)$snapshot['cms'];
+        $this->detectedCmsVersion = (string)($snapshot['version'] ?? '');
+        $this->detectedCmsSignals = array_values(array_unique($snapshot['signals'] ?? []));
+
+        $display = $this->detectedCms . ($this->detectedCmsVersion !== '' ? " {$this->detectedCmsVersion}" : '');
+        $detail = implode(', ', array_slice($this->detectedCmsSignals, 0, 3));
+        $this->addFinding(
+            'Technology',
+            'CMS Detected (fallback)',
+            'info',
+            "CMS: {$display}. Signals: {$detail}. Passive fallback ran after primary fetch failed: {$reason}.",
+            'Fix the primary connection issue first; this fallback is only for CMS visibility and is not counted in the score.',
+            [],
+            false
+        );
     }
 
     private function bodyLooksLikeValidationChallenge(string $body): bool
@@ -2046,7 +2390,7 @@ class SecurityScanner
     private function probeJoomlaEndpoints(): void
     {
         $paths = array_keys(JoomlaFingerprint::activeProbePaths());
-        $base  = $this->scheme . '://' . $this->hostname;
+        $base  = $this->originBase();
         $mh      = curl_multi_init();
         $handles = [];
 
@@ -2059,7 +2403,7 @@ class SecurityScanner
                 CURLOPT_TIMEOUT        => 6,
                 CURLOPT_CONNECTTIMEOUT => 4,
                 CURLOPT_FOLLOWLOCATION => false,
-                CURLOPT_USERAGENT      => 'SecScan/2.0',
+                CURLOPT_USERAGENT => self::TARGET_USER_AGENT,
                 CURLOPT_SSL_VERIFYPEER => false,
             ]));
             $handles[$path] = $ch;
@@ -2313,7 +2657,68 @@ class SecurityScanner
     }
 
     // ================================================================
-    //  10c. INSTALLED WORDPRESS PLUGIN FINGERPRINTING
+    //  10c. CMS-SPECIFIC HARDENING
+    // ================================================================
+
+    /** @return array{code:int,body:string}|null */
+    private function cmsHardeningProbe(string $path): ?array
+    {
+        $ch = curl_init();
+        curl_setopt_array($ch, $this->withAuth([
+            CURLOPT_URL => $this->originBase() . $path,
+            CURLOPT_RESOLVE => $this->pinResolve(), CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 8, CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_FOLLOWLOCATION => false, CURLOPT_USERAGENT => self::TARGET_USER_AGENT,
+            CURLOPT_SSL_VERIFYPEER => false,
+        ]));
+        $body = curl_exec($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $hitPrivate = $this->curlHitPrivateIp($ch);
+        $this->closeCurl($ch);
+        if ($hitPrivate || !is_string($body)) return null;
+        return ['code' => $code, 'body' => $body];
+    }
+
+    private function checkCmsHardening(): void
+    {
+        if ($this->detectedCms === 'WordPress') {
+            $users = $this->cmsHardeningProbe('/wp-json/wp/v2/users?per_page=1&_fields=id,slug');
+            $data = $users !== null ? json_decode($users['body'], true) : null;
+            $first = is_array($data) && array_is_list($data) ? ($data[0] ?? null) : null;
+            if (($users['code'] ?? 0) === 200 && is_array($first) && isset($first['id'], $first['slug'])) {
+                $this->addFinding('Technology', 'WordPress REST User Enumeration', 'warning',
+                    'The public WordPress REST API returns user identifiers and slugs.',
+                    'Restrict unauthenticated access to /wp-json/wp/v2/users if public author enumeration is not required.');
+            } else {
+                $this->addFinding('Technology', 'WordPress REST User Enumeration', 'pass',
+                    'The WordPress REST users endpoint did not expose a public user record.');
+            }
+
+            $registration = $this->cmsHardeningProbe('/wp-login.php?action=register');
+            if (($registration['code'] ?? 0) === 200 && preg_match('/\bid=["\']registerform["\']|\bname=["\']user_login["\']/i', (string)($registration['body'] ?? ''))) {
+                $this->addFinding('Technology', 'WordPress Public Registration', 'info',
+                    'WordPress registration form is publicly reachable.',
+                    'Disable public registration unless it is required, and add anti-spam, email verification, and role controls.');
+            }
+        }
+
+        if ($this->detectedCms === 'Joomla') {
+            $config = $this->cmsHardeningProbe('/api/index.php/v1/config/application');
+            $body = (string)($config['body'] ?? '');
+            if (($config['code'] ?? 0) === 200 && !$this->isHtmlBody($body)
+                && preg_match('/"(?:dbprefix|mailfrom|debug|sitename)"\s*:/i', $body)) {
+                $this->addFinding('Technology', 'Joomla Configuration API Exposure', 'warning',
+                    'The Joomla Web Services configuration endpoint returned application configuration metadata without an authentication challenge.',
+                    'Require authentication for configuration Web Services or disable the endpoint when it is not required.');
+            } else {
+                $this->addFinding('Technology', 'Joomla Configuration API Exposure', 'pass',
+                    'The Joomla configuration API did not expose application configuration metadata.');
+            }
+        }
+    }
+
+    // ================================================================
+    //  10d. INSTALLED WORDPRESS PLUGIN FINGERPRINTING
     // ================================================================
 
     /**
@@ -2352,7 +2757,7 @@ class SecurityScanner
 
         // 2. Active: confirm via readme.txt (cap requests to stay polite).
         $slugs = array_slice(array_keys($found), 0, 15);
-        $base  = $this->scheme . '://' . $this->hostname;
+        $base  = $this->originBase();
         $mh    = curl_multi_init();
         $handles = [];
         foreach ($slugs as $slug) {
@@ -2361,7 +2766,7 @@ class SecurityScanner
                 CURLOPT_URL => "{$base}/wp-content/plugins/{$slug}/readme.txt",
                 CURLOPT_RESOLVE => $this->pinResolve(), CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_TIMEOUT => 6, CURLOPT_CONNECTTIMEOUT => 4,
-                CURLOPT_FOLLOWLOCATION => false, CURLOPT_USERAGENT => 'SecScan/2.1',
+                CURLOPT_FOLLOWLOCATION => false, CURLOPT_USERAGENT => self::TARGET_USER_AGENT,
                 CURLOPT_SSL_VERIFYPEER => false,
             ]);
             $handles[$slug] = $ch;
@@ -2681,7 +3086,7 @@ class SecurityScanner
     {
         if ($this->baselineProbe['done']) return $this->baselineProbe;
 
-        $base  = $this->scheme . '://' . $this->hostname;
+        $base  = $this->originBase();
         $rand  = substr(md5((string)mt_rand() . microtime()), 0, 16);
         $paths = ["/{$rand}", "/{$rand}.php", "/{$rand}-not-here/"];
 
@@ -2692,7 +3097,7 @@ class SecurityScanner
             curl_setopt_array($ch, $this->withAuth([
                 CURLOPT_URL => $base . $p, CURLOPT_RESOLVE => $this->pinResolve(), CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_TIMEOUT => 6, CURLOPT_CONNECTTIMEOUT => 4,
-                CURLOPT_FOLLOWLOCATION => false, CURLOPT_USERAGENT => 'SecScan/2.1',
+                CURLOPT_FOLLOWLOCATION => false, CURLOPT_USERAGENT => self::TARGET_USER_AGENT,
                 CURLOPT_SSL_VERIFYPEER => false,
             ]));
             $handles[$p] = $ch;
@@ -2776,13 +3181,13 @@ class SecurityScanner
             '/docker-compose.yml' => ['docker-compose.yml — Docker config', false],
         ];
 
-        $base    = $this->scheme . '://' . $this->hostname;
+        $base    = $this->originBase();
         $mh      = curl_multi_init();
         $handles = [];
 
         foreach ($files as $path => [$desc, $critical]) {
             $ch = curl_init();
-            curl_setopt_array($ch, $this->withAuth([CURLOPT_URL => $base . $path, CURLOPT_RESOLVE => $this->pinResolve(), CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 6, CURLOPT_CONNECTTIMEOUT => 4, CURLOPT_FOLLOWLOCATION => false, CURLOPT_USERAGENT => 'SecScan/2.0', CURLOPT_SSL_VERIFYPEER => false]));
+            curl_setopt_array($ch, $this->withAuth([CURLOPT_URL => $base . $path, CURLOPT_RESOLVE => $this->pinResolve(), CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 6, CURLOPT_CONNECTTIMEOUT => 4, CURLOPT_FOLLOWLOCATION => false, CURLOPT_USERAGENT => self::TARGET_USER_AGENT, CURLOPT_SSL_VERIFYPEER => false]));
             $handles[$path] = ['handle' => $ch, 'desc' => $desc, 'critical' => $critical];
             curl_multi_add_handle($mh, $ch);
         }
@@ -2863,7 +3268,7 @@ class SecurityScanner
             '/setup.php'                 => ['Setup Script (should be removed)',       true],
         ];
 
-        $base    = $this->scheme . '://' . $this->hostname;
+        $base    = $this->originBase();
         $mh      = curl_multi_init();
         $handles = [];
 
@@ -2876,7 +3281,7 @@ class SecurityScanner
                 CURLOPT_TIMEOUT        => 6,
                 CURLOPT_CONNECTTIMEOUT => 4,
                 CURLOPT_FOLLOWLOCATION => false,
-                CURLOPT_USERAGENT      => 'SecScan/2.0',
+                CURLOPT_USERAGENT => self::TARGET_USER_AGENT,
                 CURLOPT_SSL_VERIFYPEER => false,
             ]));
             $handles[$path] = ['handle' => $ch, 'desc' => $desc, 'critical' => $critical];
@@ -3005,10 +3410,10 @@ class SecurityScanner
 
     private function checkSecurityTxt(): void
     {
-        $base  = $this->scheme . '://' . $this->hostname;
+        $base  = $this->originBase();
         foreach (['/.well-known/security.txt', '/security.txt'] as $path) {
             $ch = curl_init();
-            curl_setopt_array($ch, [CURLOPT_URL => $base . $path, CURLOPT_RESOLVE => $this->pinResolve(), CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 8, CURLOPT_USERAGENT => 'SecScan/2.0', CURLOPT_SSL_VERIFYPEER => false, CURLOPT_FOLLOWLOCATION => false]);
+            curl_setopt_array($ch, [CURLOPT_URL => $base . $path, CURLOPT_RESOLVE => $this->pinResolve(), CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 8, CURLOPT_USERAGENT => self::TARGET_USER_AGENT, CURLOPT_SSL_VERIFYPEER => false, CURLOPT_FOLLOWLOCATION => false]);
             $body = (string)curl_exec($ch);
             $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
             $this->closeCurl($ch);
@@ -3030,7 +3435,7 @@ class SecurityScanner
     private function checkRobotsTxt(): void
     {
         $ch = curl_init();
-        curl_setopt_array($ch, [CURLOPT_URL => $this->scheme . '://' . $this->hostname . '/robots.txt', CURLOPT_RESOLVE => $this->pinResolve(), CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 8, CURLOPT_USERAGENT => 'SecScan/2.1', CURLOPT_SSL_VERIFYPEER => false, CURLOPT_FOLLOWLOCATION => false]);
+        curl_setopt_array($ch, [CURLOPT_URL => $this->originBase() . '/robots.txt', CURLOPT_RESOLVE => $this->pinResolve(), CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 8, CURLOPT_USERAGENT => self::TARGET_USER_AGENT, CURLOPT_SSL_VERIFYPEER => false, CURLOPT_FOLLOWLOCATION => false]);
         $body = (string)curl_exec($ch);
         $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $this->closeCurl($ch);
@@ -3095,9 +3500,14 @@ class SecurityScanner
             }
         }
 
-        // Phase 2 — poll writable sockets (connection success = writable)
-        $deadline  = microtime(true) + $timeout;
-        $openPorts = [];
+        // Phase 2 — poll writable sockets. NOTE: a non-blocking connect() marks
+        // the descriptor writable both when it SUCCEEDS and when it fails
+        // immediately (e.g. ECONNREFUSED/RST) — see Stevens, "UNIX Network
+        // Programming" §16.3. Writability alone cannot tell the two apart, so
+        // "writable" only makes a port a *candidate*; verifyConnectedSocket()
+        // below confirms it before it is ever reported as open.
+        $deadline   = microtime(true) + $timeout;
+        $candidates = [];
 
         while (!empty($sockets) && microtime(true) < $deadline) {
             $read   = null;
@@ -3110,16 +3520,24 @@ class SecurityScanner
             foreach ($write as $sock) {
                 $port = array_search($sock, $sockets, true);
                 if ($port === false) continue;
-                $openPorts[$port] = $ports[$port];
-                fclose($sock);
+                $candidates[$port] = $sock;
                 unset($sockets[$port]);
             }
         }
 
-        // Close timed-out sockets
+        // Close sockets that never became writable within the deadline — no
+        // response (silently filtered/dropped) is correctly treated as closed.
         foreach ($sockets as $sock) { @fclose($sock); }
 
-        // Phase 3 — report
+        // Phase 3 — verify each candidate actually connected, then report.
+        $openPorts = [];
+        foreach ($candidates as $port => $sock) {
+            if ($this->verifyConnectedSocket($sock)) {
+                $openPorts[$port] = $ports[$port];
+            }
+            @fclose($sock);
+        }
+
         if (empty($openPorts)) {
             $this->addFinding('Ports', 'Port Scan', 'pass', 'No unexpected open ports detected.');
             return;
@@ -3130,6 +3548,53 @@ class SecurityScanner
             $this->addFinding('Ports', "Port {$port} ({$service})", $sev,
                 "Port {$port} ({$service}) is open. {$msg}");
         }
+    }
+
+    /**
+     * Disambiguate a "writable" async-connect socket from checkOpenPorts().
+     * A non-blocking connect() marks the descriptor writable both on success
+     * AND on an immediate refusal (RST), so writability alone is not proof
+     * the port is actually open — without this check, an actively-refused
+     * (fully closed) port would be misreported as "open", including for the
+     * critical-severity ports (MySQL/Redis/MongoDB/SMB) this check exists to
+     * flag. Verified empirically: on Linux, connecting to a closed TCP port
+     * makes the socket both readable AND writable in select(), with
+     * getsockopt(SO_ERROR) reporting ECONNREFUSED.
+     *
+     * Prefers getsockopt(SO_ERROR) via ext-sockets when available (definitive
+     * proof either way). Falls back to a short read probe when ext-sockets is
+     * not loaded: a refused/reset connection surfaces as an immediate EOF,
+     * while a genuinely open port either sends a banner (SSH, FTP, MySQL, …)
+     * or simply has nothing to say yet — in which case the read times out
+     * without EOF, which still counts as "open".
+     */
+    private function verifyConnectedSocket($sock): bool
+    {
+        if (function_exists('socket_import_stream') && function_exists('socket_get_option')) {
+            $s = @socket_import_stream($sock);
+            if ($s !== false) {
+                $err = @socket_get_option($s, SOL_SOCKET, SO_ERROR);
+                if (is_int($err)) {
+                    return $err === 0;
+                }
+            }
+        }
+
+        stream_set_blocking($sock, true);
+        stream_set_timeout($sock, 0, 250000); // 250ms peek
+        $byte = @fread($sock, 1);
+        $meta = stream_get_meta_data($sock);
+
+        if ($byte !== '' && $byte !== false) {
+            return true; // server sent data unprompted — genuinely connected
+        }
+        if (!empty($meta['timed_out'])) {
+            return true; // no data yet, but the socket did not close — still open
+        }
+        // Empty read with no timeout means the peer closed/reset the
+        // connection immediately — the earlier "writable" signal was a
+        // failed connect (refused port), not a successful one.
+        return false;
     }
 
     // ================================================================
@@ -3318,7 +3783,7 @@ class SecurityScanner
             CURLOPT_TIMEOUT        => 8,
             CURLOPT_CONNECTTIMEOUT => 5,
             CURLOPT_FOLLOWLOCATION => false,
-            CURLOPT_USERAGENT      => 'SecScan/2.1',
+            CURLOPT_USERAGENT => self::TARGET_USER_AGENT,
             CURLOPT_SSL_VERIFYPEER => false,
         ]);
         $resp = (string)@curl_exec($ch);
@@ -3347,7 +3812,7 @@ class SecurityScanner
             CURLOPT_TIMEOUT        => 8,
             CURLOPT_CONNECTTIMEOUT => 5,
             CURLOPT_FOLLOWLOCATION => false,
-            CURLOPT_USERAGENT      => 'SecScan/2.1',
+            CURLOPT_USERAGENT => self::TARGET_USER_AGENT,
             CURLOPT_SSL_VERIFYPEER => false,
         ]);
         $traceBody = (string)@curl_exec($ch2);
@@ -3383,49 +3848,276 @@ class SecurityScanner
     private function checkWAF(): void
     {
         $signatures = [
-            'Cloudflare'            => ['headers' => ['cf-ray', 'cf-cache-status', 'cf-request-id'], 'server' => ['cloudflare'], 'cookies' => ['__cfduid', '__cf_bm'], 'body' => ['attention required! | cloudflare']],
-            'AWS WAF / CloudFront'  => ['headers' => ['x-amz-cf-id', 'x-amzn-requestid', 'x-amz-apigw-id'], 'server' => ['awselb', 'cloudfront'], 'cookies' => ['aws-waf-token'], 'body' => []],
-            'Akamai'                => ['headers' => ['x-akamai-transformed', 'akamai-grn'], 'server' => ['akamaighost'], 'cookies' => ['ak_bmsc', 'bm_sz'], 'body' => ['access denied', 'reference #']],
+            'Cloudflare'            => ['headers' => ['cf-ray', 'cf-cache-status', 'cf-request-id', 'cf-mitigated'], 'server' => ['cloudflare'], 'cookies' => ['__cfduid', '__cf_bm', 'cf_clearance'], 'body' => ['attention required! | cloudflare', 'cloudflare ray id', 'checking your browser before accessing']],
+            'AWS WAF / CloudFront'  => ['headers' => ['x-amz-cf-id', 'x-amzn-requestid', 'x-amz-apigw-id'], 'server' => ['awselb', 'cloudfront'], 'cookies' => ['aws-waf-token'], 'body' => ['request blocked']],
+            'Akamai'                => ['headers' => ['x-akamai-transformed', 'akamai-grn'], 'server' => ['akamaighost'], 'cookies' => ['ak_bmsc', 'bm_sz', '_abck'], 'body' => ['access denied', 'reference #']],
             'Imperva / Incapsula'   => ['headers' => ['x-iinfo', 'x-cdn'], 'server' => ['incapsula'], 'cookies' => ['incap_ses', 'visid_incap'], 'body' => ['incapsula incident id', 'powered by incapsula']],
             'Sucuri'                => ['headers' => ['x-sucuri-id', 'x-sucuri-cache'], 'server' => ['sucuri/cloudproxy'], 'cookies' => [], 'body' => ['sucuri website firewall', 'access denied - sucuri']],
-            'F5 BIG-IP ASM'         => ['headers' => [], 'server' => ['big-ip', 'bigip'], 'cookies' => ['ts', 'bigipserver'], 'body' => ['the requested url was rejected']],
+            'F5 BIG-IP ASM'         => ['headers' => [], 'server' => ['big-ip', 'bigip'], 'cookies' => ['ts', 'bigipserver', 'bnis_x-bni-jas', 'x-bni-ci', 'f5_cspm'], 'body' => ['the requested url was rejected', 'validation request', 'user validation required', 'captcha_resp', 'web page blocked']],
             'Barracuda'             => ['headers' => [], 'server' => ['barracuda'], 'cookies' => ['barra_counter_session'], 'body' => ['barracuda']],
             'Fastly'                => ['headers' => ['x-fastly-request-id', 'fastly-debug-digest'], 'server' => ['fastly'], 'cookies' => [], 'body' => []],
             'Azure (Front Door/WAF)'=> ['headers' => ['x-azure-ref', 'x-msedge-ref'], 'server' => [], 'cookies' => [], 'body' => []],
             'Wordfence'             => ['headers' => [], 'server' => [], 'cookies' => ['wordfence_verifiedhuman'], 'body' => ['generated by wordfence']],
             'ModSecurity'           => ['headers' => ['x-mod-security'], 'server' => ['mod_security', 'modsecurity'], 'cookies' => [], 'body' => ['mod_security', 'this error was generated by mod_security']],
+            'Fortinet FortiWeb'     => ['headers' => ['x-fortiweb'], 'server' => ['fortiweb'], 'cookies' => ['fortiwafsid'], 'body' => ['fortiweb']],
+            'Citrix ADC / NetScaler'=> ['headers' => ['ns_af', 'citrix_ns_id', 'x-citrix-application'], 'server' => ['netscaler', 'citrix adc'], 'cookies' => ['nsc_', 'citrix_ns_id', 'ns_af'], 'body' => ['citrix adc', 'netscaler application firewall']],
+            'Radware AppWall'       => ['headers' => ['x-sl-compstate', 'x-sl-request-id'], 'server' => ['radware'], 'cookies' => ['rdwr'], 'body' => ['radware appwall', 'appwall']],
+            'Wallarm'               => ['headers' => ['x-wallarm-request-id'], 'server' => ['wallarm'], 'cookies' => [], 'body' => ['wallarm']],
+            'Reblaze'               => ['headers' => ['x-reblaze-id'], 'server' => ['reblaze'], 'cookies' => ['rbzid', 'rbzsessionid'], 'body' => ['reblaze']],
+            'DDoS-Guard'            => ['headers' => ['x-ddos-guard'], 'server' => ['ddos-guard'], 'cookies' => ['__ddg1_', '__ddgid_', '__ddgmark_'], 'body' => ['ddos-guard']],
+            'StackPath'             => ['headers' => ['x-sp-cache', 'x-stackpath-cache'], 'server' => ['stackpath'], 'cookies' => ['sp_lit'], 'body' => ['stackpath']],
+            'NAXSI'                 => ['headers' => ['x-naxsi'], 'server' => [], 'cookies' => [], 'body' => ['naxsi']],
+            'Imunify360'            => ['headers' => [], 'server' => [], 'cookies' => ['imunify360_uuid', 'imunify360_uid'], 'body' => ['imunify360']],
+            'CloudWAF / Huawei Cloud WAF' => ['headers' => [], 'server' => ['cloudwaf'], 'cookies' => ['hwwafsesid', 'hwwafsestime'], 'body' => ['cloudwaf']],
         ];
 
-        $serverHdr = strtolower($this->getHeader('server') ?? '');
-        $bodyLower = strtolower(substr($this->responseBody, 0, 100000));
-        $cookieStr = strtolower(implode(' | ', $this->cookies));
+        $headersForWaf = $this->primaryResponseHeaders ?: $this->responseHeaders;
+        $bodyForWaf = $this->primaryResponseBody !== '' ? $this->primaryResponseBody : $this->responseBody;
+        $cookiesForWaf = $this->primaryCookies ?: $this->cookies;
+        $seed = strtolower(json_encode($headersForWaf, JSON_UNESCAPED_SLASHES) . ' ' . implode(' ', $cookiesForWaf) . ' ' . substr($bodyForWaf, 0, 4000));
+        if (!preg_match('/cf-ray|cloudflare|bnis_x-bni-jas|x-bni-ci|bigip|incap_ses|visid_incap|hwwaf|x-sucuri|akamai|aws-waf|x-wallarm|x-ddos-guard|x-sl-request-id|fortiwaf|citrix|nsc_|mod_security|validation request|captcha_resp/i', $seed)) {
+            $probe = $this->fetchWafFingerprintProbe();
+            foreach ($probe['headers'] as $name => $values) {
+                $headersForWaf[$name] = array_merge($headersForWaf[$name] ?? [], $values);
+            }
+            $cookiesForWaf = array_merge($cookiesForWaf, $probe['cookies']);
+            if ($bodyForWaf === '' && $probe['body'] !== '') {
+                $bodyForWaf = $probe['body'];
+            }
+        }
+        $getWafHeader = static fn(string $name): ?string => $headersForWaf[strtolower($name)][0] ?? null;
+
+        $serverHdr = strtolower($getWafHeader('server') ?? '');
+        $bodyLower = strtolower(substr($bodyForWaf, 0, 100000));
+        $cookieNames = [];
+        foreach ($cookiesForWaf as $cookie) {
+            $name = strtolower(trim(explode('=', explode(';', $cookie, 2)[0], 2)[0] ?? ''));
+            if ($name !== '') {
+                $cookieNames[] = $name;
+            }
+        }
+        $cookieMatches = static function (string $needle) use ($cookieNames): bool {
+            $needle = strtolower($needle);
+            foreach ($cookieNames as $name) {
+                if ($name === $needle || str_starts_with($name, $needle)) {
+                    return true;
+                }
+            }
+            return false;
+        };
 
         $detected = [];
+        $evidence = [];
         foreach ($signatures as $name => $sig) {
             foreach ($sig['headers'] as $h) {
-                if ($this->getHeader($h) !== null) { $detected[$name] = true; }
+                if ($getWafHeader($h) !== null) {
+                    $detected[$name] = true;
+                    $evidence[$name][] = "header {$h}";
+                }
             }
             foreach ($sig['server'] as $s) {
-                if ($s !== '' && str_contains($serverHdr, $s)) { $detected[$name] = true; }
+                if ($s !== '' && str_contains($serverHdr, $s)) {
+                    $detected[$name] = true;
+                    $evidence[$name][] = "server {$s}";
+                }
             }
             foreach ($sig['cookies'] as $c) {
-                if ($c !== '' && str_contains($cookieStr, $c)) { $detected[$name] = true; }
+                if ($c !== '' && $cookieMatches($c)) {
+                    $detected[$name] = true;
+                    $evidence[$name][] = "cookie {$c}";
+                }
             }
             foreach ($sig['body'] as $b) {
-                if ($b !== '' && str_contains($bodyLower, $b)) { $detected[$name] = true; }
+                if ($b !== '' && str_contains($bodyLower, $b)) {
+                    $detected[$name] = true;
+                    $evidence[$name][] = "body marker {$b}";
+                }
             }
         }
 
         if (!empty($detected)) {
             $list = implode(', ', array_keys($detected));
+            $this->detectedWafVendors = array_keys($detected);
+            $this->detectedWafSignals = array_map(
+                static fn(array $signals): array => array_values(array_unique($signals)),
+                $evidence
+            );
+            $signalSummary = [];
+            foreach ($this->detectedWafVendors as $vendor) {
+                $sigList = $this->detectedWafSignals[$vendor] ?? [];
+                if ($sigList !== []) {
+                    $signalSummary[] = $vendor . ' (' . implode(', ', array_slice($sigList, 0, 2)) . ')';
+                }
+            }
             $this->addFinding('Technology', 'WAF / Edge Protection', 'pass',
-                "Web Application Firewall / edge protection detected: {$list}.",
+                "Web Application Firewall / edge protection detected: {$list}. Signals: " . implode('; ', array_slice($signalSummary, 0, 4)) . ".",
                 'Confirm the WAF is in blocking (not detection-only) mode and that rule sets are kept current.');
         } else {
+            if ($this->applyWafOverride('waf_probe_no_fingerprint')) {
+                return;
+            }
+            $this->detectedWafVendors = [];
+            $this->detectedWafSignals = [];
             $this->addFinding('Technology', 'WAF / Edge Protection', 'info',
                 'No Web Application Firewall fingerprint detected from headers, cookies, or body.',
                 'A WAF (e.g. Cloudflare, AWS WAF, ModSecurity) adds a layer of protection against common web attacks. Absence is not a vulnerability by itself but reduces defence-in-depth.');
         }
+    }
+
+    private function applyWafOverride(string $reason = '', string $detail = ''): bool
+    {
+        if ($this->detectedWafVendors !== []) {
+            return false;
+        }
+
+        $override = $this->lookupWafOverride($this->hostname);
+        if ($override === null) {
+            return false;
+        }
+
+        $vendors = array_values(array_filter(array_map(
+            static fn($v): string => trim((string)$v),
+            is_array($override['vendors'] ?? null) ? $override['vendors'] : []
+        )));
+        if ($vendors === []) {
+            return false;
+        }
+
+        $signals = array_values(array_filter(array_map(
+            static fn($v): string => trim((string)$v),
+            is_array($override['signals'] ?? null) ? $override['signals'] : []
+        )));
+        $source = trim((string)($override['source'] ?? 'Local WAF evidence override'));
+        if ($signals === []) {
+            $signals = [$source];
+        }
+
+        $signalMap = [];
+        foreach ($vendors as $vendor) {
+            $signalMap[$vendor] = $signals;
+        }
+
+        $this->detectedWafVendors = $vendors;
+        $this->detectedWafSignals = $signalMap;
+
+        $message = 'WAF / edge protection identified from local evidence override: '
+            . implode(', ', $vendors)
+            . '. Signals: '
+            . implode('; ', array_slice($signals, 0, 4))
+            . '.';
+        if ($detail !== '') {
+            $message .= ' Scanner connection detail: ' . $detail;
+        }
+
+        $this->addFinding(
+            'Technology',
+            'WAF / Edge Protection',
+            'info',
+            $message,
+            'Validate the fingerprint with the target owner and allowlist the SecScan server IP if authorised scanning should complete.',
+            [],
+            false
+        );
+
+        if ($reason === 'reachability_failure' && $this->scanBlocked === []) {
+            $this->scanBlocked = [
+                'type' => 'network_waf_timeout',
+                'title' => 'Scan tidak dapat melengkapkan sambungan; WAF / firewall disyaki',
+                'message' => 'Server SecScan tidak menerima respons daripada target, tetapi sistem mempunyai bukti fingerprint WAF untuk hostname ini.',
+                'actions' => [
+                    'Allowlist IP/server SecScan pada WAF, firewall, atau load balancer target.',
+                    'Minta pemilik target sahkan fingerprint WAF dan window scan yang dibenarkan.',
+                    'Ulang scan selepas akses dari server SecScan dibenarkan.',
+                ],
+            ];
+        }
+
+        return true;
+    }
+
+    private function lookupWafOverride(string $host): ?array
+    {
+        static $overrides = null;
+        if ($overrides === null) {
+            $paths = array_filter([
+                getenv('SECSCAN_WAF_OVERRIDES_FILE') ?: null,
+                __DIR__ . '/src/waf_overrides.json',
+                __DIR__ . '/data/waf_overrides.json',
+            ]);
+            $overrides = [];
+            foreach ($paths as $path) {
+                if (!is_readable($path)) {
+                    continue;
+                }
+                $raw = file_get_contents($path);
+                $decoded = is_string($raw) ? json_decode($raw, true) : null;
+                if (is_array($decoded)) {
+                    $overrides = $decoded;
+                    break;
+                }
+            }
+        }
+
+        $host = strtolower(rtrim(trim($host), '.'));
+        if ($host === '' || $overrides === []) {
+            return null;
+        }
+
+        $candidates = [$host];
+        if (str_starts_with($host, 'www.')) {
+            $candidates[] = substr($host, 4);
+        } else {
+            $candidates[] = 'www.' . $host;
+        }
+
+        foreach (array_unique($candidates) as $candidate) {
+            if (isset($overrides[$candidate]) && is_array($overrides[$candidate])) {
+                return $overrides[$candidate];
+            }
+        }
+
+        return null;
+    }
+
+    private function fetchWafFingerprintProbe(): array
+    {
+        $headers = [];
+        $cookies = [];
+        $ch = curl_init();
+        curl_setopt_array($ch, $this->withAuth([
+            CURLOPT_URL            => $this->url,
+            CURLOPT_RESOLVE        => $this->pinResolve(),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_NOBODY         => true,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_TIMEOUT        => 8,
+            CURLOPT_CONNECTTIMEOUT => 4,
+            CURLOPT_USERAGENT => self::TARGET_USER_AGENT,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_HTTP_VERSION   => CURL_HTTP_VERSION_1_1,
+            CURLOPT_HEADERFUNCTION => static function ($ch, $header) use (&$headers, &$cookies) {
+                $len = strlen($header);
+                $parts = explode(':', $header, 2);
+                if (count($parts) === 2) {
+                    $name  = strtolower(trim($parts[0]));
+                    $value = trim($parts[1]);
+                    $headers[$name][] = $value;
+                }
+                if (stripos($header, 'Set-Cookie:') === 0) {
+                    $cookies[] = trim(substr($header, 11));
+                }
+                return $len;
+            },
+        ]));
+        $body = curl_exec($ch);
+        $this->closeCurl($ch);
+
+        return [
+            'headers' => $headers,
+            'cookies' => $cookies,
+            'body'    => is_string($body) ? $body : '',
+        ];
     }
 
     // ================================================================
@@ -3441,12 +4133,14 @@ class SecurityScanner
         if (preg_match('/PHP\/(\d+)\.(\d+)(?:\.(\d+))?/i', $powered, $m)) {
             $major = (int)$m[1]; $minor = (int)$m[2];
             $ver = "{$major}.{$minor}";
-            // PHP branches < 8.1 are end-of-life as of June 2026 (no security fixes).
-            if ($major < 8 || ($major === 8 && $minor < 1)) {
+            // PHP branches < 8.2 are end-of-life as of mid-2026 (8.1 reached EOL
+            // 2025-12-31; keep this cutoff moving forward as branches age out —
+            // see https://www.php.net/supported-versions.php.
+            if ($major < 8 || ($major === 8 && $minor < 2)) {
                 $flagged = true;
                 $this->addFinding('Technology', 'Outdated PHP', 'critical',
                     "PHP {$ver} is end-of-life and no longer receives security patches.",
-                    'Upgrade to a supported PHP branch (8.2+). Check the EOL calendar at https://www.php.net/supported-versions.php.',
+                    'Upgrade to a supported PHP branch (8.3+). Check the EOL calendar at https://www.php.net/supported-versions.php.',
                     ['https://www.php.net/supported-versions.php', 'https://endoflife.date/php']);
             }
         }
@@ -3464,7 +4158,10 @@ class SecurityScanner
             }
         }
         if (preg_match('/nginx\/(\d+)\.(\d+)\.(\d+)/i', $server, $m)) {
-            if ((int)$m[1] === 1 && (int)$m[2] < 24) {
+            // Current stable is 1.30.x as of mid-2026 (nginx.org/en/download.html);
+            // flag anything more than a couple of minor releases behind. Update
+            // this cutoff periodically as new stable branches ship.
+            if ((int)$m[1] === 1 && (int)$m[2] < 28) {
                 $flagged = true;
                 $this->addFinding('Technology', 'Outdated nginx', 'warning',
                     "nginx {$m[1]}.{$m[2]}.{$m[3]} is behind the current stable branch.",
@@ -3578,13 +4275,13 @@ class SecurityScanner
         // Fetch the page body to look for the "unclaimed resource" fingerprint.
         $ch = curl_init();
         curl_setopt_array($ch, [
-            CURLOPT_URL            => $this->scheme . '://' . $host . '/',
+            CURLOPT_URL            => $this->originBase() . '/',
             CURLOPT_RESOLVE        => $this->pinResolve(),
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT        => 8,
             CURLOPT_CONNECTTIMEOUT => 5,
             CURLOPT_FOLLOWLOCATION => false,
-            CURLOPT_USERAGENT      => 'SecScan/2.1',
+            CURLOPT_USERAGENT => self::TARGET_USER_AGENT,
             CURLOPT_SSL_VERIFYPEER => false,
         ]);
         $probeBody  = strtolower((string)@curl_exec($ch));
@@ -3632,44 +4329,15 @@ class SecurityScanner
     private function checkCORSReflection(): void
     {
         $probeOrigin = 'https://secscan-cors-probe.example'; // reserved TLD (RFC 2606)
-
-        $ch = curl_init();
-        curl_setopt_array($ch, [
-            CURLOPT_URL            => $this->url,
-            CURLOPT_RESOLVE        => $this->pinResolve(),
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_HEADER         => true,
-            CURLOPT_NOBODY         => true,
-            CURLOPT_TIMEOUT        => 8,
-            CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_FOLLOWLOCATION => false,
-            CURLOPT_USERAGENT      => 'SecScan/2.1',
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_HTTPHEADER     => ['Origin: ' . $probeOrigin],
-        ]);
-        $resp       = (string)@curl_exec($ch);
-        $hitPrivate = $this->curlHitPrivateIp($ch);
-        $this->closeCurl($ch);
-        if ($hitPrivate) {
-            return;
-        }
-
-        $acao = '';
-        if (preg_match('/^Access-Control-Allow-Origin:\s*(.+)$/mi', $resp, $m)) {
-            $acao = trim($m[1]);
-        }
-        $acac = '';
-        if (preg_match('/^Access-Control-Allow-Credentials:\s*(.+)$/mi', $resp, $m)) {
-            $acac = strtolower(trim($m[1]));
-        }
+        $headers = $this->corsProbe($probeOrigin);
+        if ($headers === null) return;
+        $acao = $headers['acao'];
+        $acac = $headers['acac'];
 
         if ($acao === '') {
             $this->addFinding('CORS', 'CORS Reflection', 'pass',
                 'The server did not reflect an arbitrary Origin in Access-Control-Allow-Origin.');
-            return;
-        }
-
-        if (strcasecmp($acao, $probeOrigin) === 0) {
+        } elseif (strcasecmp($acao, $probeOrigin) === 0) {
             if ($acac === 'true') {
                 $this->addFinding('CORS', 'CORS Reflection', 'critical',
                     "Server reflects any Origin (tested {$probeOrigin}) and also sends Access-Control-Allow-Credentials: true — any website can read this site's authenticated responses on a victim's behalf.",
@@ -3683,6 +4351,56 @@ class SecurityScanner
             $this->addFinding('CORS', 'CORS Reflection', 'pass',
                 "An arbitrary Origin was not reflected (Access-Control-Allow-Origin: {$acao}).");
         }
+
+        // `null` is a special opaque origin produced by sandboxed iframes and
+        // local files. It must be evaluated separately from a normal attacker
+        // URL because some origin allow-lists accidentally include it.
+        $null = $this->corsProbe('null');
+        if ($null !== null && strtolower($null['acao']) === 'null') {
+            $severity = $null['acac'] === 'true' ? 'critical' : 'warning';
+            $this->addFinding('CORS', 'CORS Null Origin', $severity,
+                "Server accepts Origin: null" . ($null['acac'] === 'true' ? ' with credentials.' : '.'),
+                'Never allow the null origin. Use an explicit allow-list of HTTPS application origins.');
+        }
+
+        // A non-mutating OPTIONS preflight checks whether an arbitrary origin
+        // can request a sensitive method. No application state is changed.
+        $preflight = $this->corsProbe($probeOrigin, true);
+        if ($preflight !== null && strcasecmp($preflight['acao'], $probeOrigin) === 0
+            && $preflight['acac'] === 'true'
+            && preg_match('/(?:^|,\s*)(?:DELETE|\*)(?:,|$)/i', $preflight['acam'])) {
+            $this->addFinding('CORS', 'CORS Credentialed Preflight', 'critical',
+                'An arbitrary Origin is approved for credentialed DELETE preflight requests.',
+                'Validate Origin against an explicit allow-list and restrict credentialed CORS methods to only the required trusted applications.');
+        }
+    }
+
+    /** @return array{acao:string,acac:string,acam:string}|null */
+    private function corsProbe(string $origin, bool $preflight = false): ?array
+    {
+        $headers = ['Origin: ' . $origin];
+        if ($preflight) {
+            $headers[] = 'Access-Control-Request-Method: DELETE';
+            $headers[] = 'Access-Control-Request-Headers: X-SecScan-Probe';
+        }
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL => $this->url, CURLOPT_RESOLVE => $this->pinResolve(),
+            CURLOPT_RETURNTRANSFER => true, CURLOPT_HEADER => true,
+            CURLOPT_NOBODY => !$preflight, CURLOPT_CUSTOMREQUEST => $preflight ? 'OPTIONS' : 'HEAD',
+            CURLOPT_TIMEOUT => 8, CURLOPT_CONNECTTIMEOUT => 5, CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_USERAGENT => self::TARGET_USER_AGENT, CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_HTTPHEADER => $headers,
+        ]);
+        $response = (string)@curl_exec($ch);
+        $hitPrivate = $this->curlHitPrivateIp($ch);
+        $this->closeCurl($ch);
+        if ($hitPrivate) return null;
+
+        $read = static function (string $name) use ($response): string {
+            return preg_match('/^' . preg_quote($name, '/') . ':\s*(.+)$/mi', $response, $m) ? trim($m[1]) : '';
+        };
+        return ['acao' => $read('Access-Control-Allow-Origin'), 'acac' => strtolower($read('Access-Control-Allow-Credentials')), 'acam' => $read('Access-Control-Allow-Methods')];
     }
 
     // ================================================================
@@ -3691,7 +4409,7 @@ class SecurityScanner
 
     private function checkCrossDomainPolicy(): void
     {
-        $base = $this->scheme . '://' . $this->hostname;
+        $base = $this->originBase();
         $targets = [
             '/crossdomain.xml'        => 'Adobe Flash/Acrobat cross-domain policy',
             '/clientaccesspolicy.xml' => 'Silverlight client-access policy',
@@ -3704,7 +4422,7 @@ class SecurityScanner
             curl_setopt_array($ch, $this->withAuth([
                 CURLOPT_URL => $base . $path, CURLOPT_RESOLVE => $this->pinResolve(),
                 CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 6, CURLOPT_CONNECTTIMEOUT => 4,
-                CURLOPT_FOLLOWLOCATION => false, CURLOPT_USERAGENT => 'SecScan/2.1', CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_FOLLOWLOCATION => false, CURLOPT_USERAGENT => self::TARGET_USER_AGENT, CURLOPT_SSL_VERIFYPEER => false,
             ]));
             $handles[$path] = ['ch' => $ch, 'desc' => $desc];
             curl_multi_add_handle($mh, $ch);
@@ -3754,7 +4472,7 @@ class SecurityScanner
 
     private function checkDirectoryListing(): void
     {
-        $base = $this->scheme . '://' . $this->hostname;
+        $base = $this->originBase();
         $dirs = ['/images/', '/img/', '/assets/', '/uploads/', '/files/', '/css/', '/js/', '/backup/', '/old/', '/tmp/', '/static/', '/media/'];
 
         $mh = curl_multi_init();
@@ -3764,7 +4482,7 @@ class SecurityScanner
             curl_setopt_array($ch, $this->withAuth([
                 CURLOPT_URL => $base . $d, CURLOPT_RESOLVE => $this->pinResolve(),
                 CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 6, CURLOPT_CONNECTTIMEOUT => 4,
-                CURLOPT_FOLLOWLOCATION => false, CURLOPT_USERAGENT => 'SecScan/2.1', CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_FOLLOWLOCATION => false, CURLOPT_USERAGENT => self::TARGET_USER_AGENT, CURLOPT_SSL_VERIFYPEER => false,
             ]));
             $handles[$d] = $ch;
             curl_multi_add_handle($mh, $ch);
@@ -3901,7 +4619,7 @@ class SecurityScanner
 
     private function checkApiGraphQL(): void
     {
-        $base    = $this->scheme . '://' . $this->hostname;
+        $base    = $this->originBase();
         $paths   = ['/graphql', '/api/graphql', '/v1/graphql', '/graphql/v1', '/query'];
         $payload = '{"query":"query{__schema{queryType{name}}}"}';
 
@@ -3917,7 +4635,7 @@ class SecurityScanner
                 CURLOPT_TIMEOUT        => 8,
                 CURLOPT_CONNECTTIMEOUT => 5,
                 CURLOPT_FOLLOWLOCATION => false,
-                CURLOPT_USERAGENT      => 'SecScan/2.1',
+                CURLOPT_USERAGENT => self::TARGET_USER_AGENT,
                 CURLOPT_SSL_VERIFYPEER => false,
                 CURLOPT_POST           => true,
                 CURLOPT_POSTFIELDS     => $payload,
@@ -4280,6 +4998,11 @@ class SecurityScanner
             'scan_blocked'    => $this->scanBlocked !== [],
             'scan_blocked_type' => (string)($this->scanBlocked['type'] ?? ''),
             'scan_blocked_detail' => $this->scanBlocked,
+            'waf'             => [
+                'detected' => $this->detectedWafVendors !== [],
+                'vendors'  => $this->detectedWafVendors,
+                'signals'  => $this->detectedWafSignals,
+            ],
             'edge'            => ['cloudflare' => $this->isCloudflareEdge()],
             'tls'             => [
                 'protocol'       => $this->negotiatedTlsProtocol,

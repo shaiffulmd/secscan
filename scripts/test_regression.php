@@ -6,6 +6,7 @@ if (PHP_SAPI !== 'cli') {
 }
 
 require_once dirname(__DIR__) . '/scanner.php';
+require_once dirname(__DIR__) . '/src/GeoIp.php';
 
 $failures = [];
 
@@ -29,6 +30,15 @@ foreach (['127.0.0.1', '10.0.0.1', '100.64.0.1', '203.0.113.1', 'localhost'] as 
     $result = UrlGuard::normalizeAndValidate($target);
     $assert(($result['ok'] ?? false) === false, "Unsafe target {$target} should be blocked.");
 }
+
+$credentialTarget = UrlGuard::normalizeAndValidate('https://user:secret@8.8.8.8/');
+$assert(($credentialTarget['ok'] ?? true) === false, 'URLs containing credentials must be rejected.');
+
+$geoPdo = new PDO('sqlite::memory:');
+$geoPdo->exec('CREATE TABLE geoip_country (family INTEGER NOT NULL, ip_start BLOB NOT NULL, ip_end BLOB NOT NULL, country TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (family, ip_start))');
+$geoPdo->prepare('INSERT INTO geoip_country VALUES (?, ?, ?, ?, ?)')->execute([4, inet_pton('8.8.8.0'), inet_pton('8.8.8.255'), 'US', '2026-07-10T00:00:00Z']);
+$assertSame('US', GeoIp::lookup($geoPdo, '8.8.8.8'), 'GeoIP should resolve a matching local IPv4 range.');
+$assertSame('', GeoIp::lookup($geoPdo, '8.8.9.1'), 'GeoIP should not resolve an IP outside the local range.');
 
 $scanner = new SecurityScanner('https://8.8.8.8');
 $ref = new ReflectionClass(SecurityScanner::class);
@@ -64,6 +74,33 @@ $assertSame('6.5.4', $cmsResult['detected_cms_version'] ?? null, 'Detected CMS v
 
 $cms = $cmsFindingFor('{"asset":"https:\/\/example.com\/wp-content\/themes\/main\/style.css"}');
 $assert($cms !== null && str_contains($cms->message, 'WordPress'), 'WordPress should be detected from escaped wp-content asset paths.');
+
+$kedaLikeWordPress = <<<'HTML'
+<!doctype html>
+<html lang="ms-MY">
+<head>
+  <link rel="alternate" title="oEmbed (JSON)" type="application/json+oembed" href="https://www.example.gov.my/index.php/wp-json/oembed/1.0/embed?url=https%3A%2F%2Fwww.example.gov.my%2F">
+  <link rel="stylesheet" href="https://www.example.gov.my/wp-content/themes/keda_web/style.css?ver=20260128-v10">
+  <link rel="stylesheet" href="https://www.example.gov.my/wp-includes/css/dashicons.min.css?ver=6.9">
+  <script src="https://www.example.gov.my/wp-includes/js/wp-emoji-release.min.js?ver=6.9"></script>
+</head>
+</html>
+HTML;
+$kedaWpScanner = new SecurityScanner('https://8.8.8.8');
+$ref->getProperty('responseBody')->setValue($kedaWpScanner, $kedaLikeWordPress);
+$ref->getMethod('checkCMSDetection')->invoke($kedaWpScanner);
+$kedaWpResult = $ref->getMethod('buildResult')->invoke($kedaWpScanner);
+$assertSame('WordPress', $kedaWpResult['detected_cms'] ?? null, 'KEDA-like WordPress source should expose detected_cms.');
+$assertSame('6.9', $kedaWpResult['detected_cms_version'] ?? null, 'WordPress core asset version should be exposed when generator meta is hidden.');
+
+$snapshot = $ref->getMethod('passiveCmsSnapshot')->invoke($scanner, $kedaLikeWordPress, [
+    'link' => ['<https://www.example.gov.my/index.php/wp-json/oembed/1.0/embed>; rel="alternate"'],
+], ['pll_language=ms; path=/; secure; SameSite=Lax']);
+$assertSame('WordPress', $snapshot['cms'] ?? null, 'Passive fallback snapshot should detect KEDA-like WordPress.');
+$assertSame('6.9', $snapshot['version'] ?? null, 'Passive fallback snapshot should keep the WordPress core version.');
+
+$cms = $cmsFindingFor('<img src="https://www.moe.gov.my/wp-content/uploads/peta.svg"><img src="/wp-content/uploads/faq.svg">');
+$assert($cms === null, 'WordPress should not be detected from wp-content/uploads media assets alone.');
 
 $cms = $cmsFindingFor('', ['link' => ['<https://example.com/wp-json/>; rel="https://api.w.org/"']]);
 $assert($cms !== null && str_contains($cms->message, 'WordPress'), 'WordPress should be detected from api.w.org Link header.');
@@ -114,6 +151,46 @@ $assert(
     !(bool)array_filter($challengeTech, fn($f) => ($f['check'] ?? '') === 'CMS Detection' && ($f['severity'] ?? '') === 'pass'),
     'Captcha/validation pages should not produce a false "No common CMS" pass.'
 );
+
+$wafScanner = new SecurityScanner('https://8.8.8.8');
+$ref->getProperty('responseHeaders')->setValue($wafScanner, [
+    'cf-ray' => ['abc-KUL'],
+]);
+$ref->getProperty('cookies')->setValue($wafScanner, [
+    'BNIS_x-bni-jas=test; Path=/',
+]);
+$ref->getProperty('responseBody')->setValue($wafScanner, '<html><title>Validation request</title><form action="/captcha_resp"></form></html>');
+$ref->getMethod('checkWAF')->invoke($wafScanner);
+$wafResult = $ref->getMethod('buildResult')->invoke($wafScanner);
+$assertSame(true, $wafResult['waf']['detected'] ?? null, 'WAF result should expose detected=true.');
+$assert(in_array('Cloudflare', $wafResult['waf']['vendors'] ?? [], true), 'WAF result should include Cloudflare from cf-ray.');
+$assert(in_array('F5 BIG-IP ASM', $wafResult['waf']['vendors'] ?? [], true), 'WAF result should include F5 BIG-IP ASM from BNIS/captcha markers.');
+$assert(isset($wafResult['waf']['signals']['Cloudflare']), 'WAF result should include Cloudflare evidence signals.');
+$assert(isset($wafResult['waf']['signals']['F5 BIG-IP ASM']), 'WAF result should include F5 evidence signals.');
+
+$extraWafScanner = new SecurityScanner('https://8.8.8.8');
+$ref->getProperty('responseHeaders')->setValue($extraWafScanner, [
+    'x-wallarm-request-id' => ['req-1'],
+    'x-ddos-guard' => ['active'],
+    'x-sl-request-id' => ['radware-1'],
+    'server' => ['CloudWAF'],
+]);
+$ref->getProperty('cookies')->setValue($extraWafScanner, [
+    'NSC_example=1; Path=/',
+    'rbzid=abc; Path=/',
+    'imunify360_uuid=abc; Path=/',
+    'HWWAFSESID=abc; Path=/',
+]);
+$ref->getMethod('checkWAF')->invoke($extraWafScanner);
+$extraWafResult = $ref->getMethod('buildResult')->invoke($extraWafScanner);
+$extraVendors = $extraWafResult['waf']['vendors'] ?? [];
+$assert(in_array('Citrix ADC / NetScaler', $extraVendors, true), 'WAF result should include Citrix ADC / NetScaler from NSC_ cookie.');
+$assert(in_array('Radware AppWall', $extraVendors, true), 'WAF result should include Radware AppWall from x-sl-request-id.');
+$assert(in_array('Wallarm', $extraVendors, true), 'WAF result should include Wallarm from x-wallarm-request-id.');
+$assert(in_array('Reblaze', $extraVendors, true), 'WAF result should include Reblaze from rbzid cookie.');
+$assert(in_array('DDoS-Guard', $extraVendors, true), 'WAF result should include DDoS-Guard from x-ddos-guard.');
+$assert(in_array('Imunify360', $extraVendors, true), 'WAF result should include Imunify360 from imunify360_uuid cookie.');
+$assert(in_array('CloudWAF / Huawei Cloud WAF', $extraVendors, true), 'WAF result should include CloudWAF / Huawei Cloud WAF from server/cookie markers.');
 
 $cms = $cmsFindingFor('<script type="application/json" data-drupal-selector="drupal-settings-json">{}</script>');
 $assert($cms !== null && str_contains($cms->message, 'Drupal'), 'Drupal should be detected from drupal-settings-json.');

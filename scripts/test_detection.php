@@ -81,6 +81,23 @@ check('random hash does not false-positive', count($scanner->scanBodyForSecrets(
 echo "\n";
 
 // ------------------------------------------------------------------
+// 1b. Client-side dependency fingerprints
+// ------------------------------------------------------------------
+echo "Part 1b — analyzeClientSideDependencies()\n";
+$deps = $scanner->analyzeClientSideDependencies(
+    '<script src="/assets/jquery-3.4.1.min.js"></script>'
+    . '<script src="/js/lodash-4.17.20.min.js"></script>'
+    . '<script src="/js/angular-1.8.2.min.js"></script>'
+);
+$depKeys = array_map(static fn(array $d): string => $d['name'] . ' ' . $d['version'], $deps);
+check('detects vulnerable jQuery version', in_array('jQuery 3.4.1', $depKeys, true));
+check('detects vulnerable Lodash version', in_array('Lodash 4.17.20', $depKeys, true));
+check('detects AngularJS end-of-life', in_array('AngularJS 1.8.2', $depKeys, true));
+check('does not flag patched jQuery', $scanner->analyzeClientSideDependencies('<script src="/jquery-3.7.1.min.js"></script>') === []);
+
+echo "\n";
+
+// ------------------------------------------------------------------
 // 2. CSRF form analysis
 // ------------------------------------------------------------------
 echo "Part 2 — analyzeFormsForCsrf()\n";
@@ -205,6 +222,14 @@ check('withAuth preserves caller headers + adds auth',
 $crossHost = $mWithAuth->invoke($s4, [CURLOPT_URL => 'https://redirected.example.test/api']);
 check('withAuth skips credentials for redirected host',
     !isset($crossHost[CURLOPT_COOKIE]) && !isset($crossHost[CURLOPT_HTTPHEADER]));
+$crossPort = $mWithAuth->invoke($s4, [CURLOPT_URL => 'https://secure.example.test:8443/api']);
+check('withAuth skips credentials for a different port',
+    !isset($crossPort[CURLOPT_COOKIE]) && !isset($crossPort[CURLOPT_HTTPHEADER]));
+$plainHttp = $mWithAuth->invoke($s4, [CURLOPT_URL => 'http://secure.example.test/api']);
+check('withAuth skips credentials over plaintext HTTP',
+    !isset($plainHttp[CURLOPT_COOKIE]) && !isset($plainHttp[CURLOPT_HTTPHEADER]));
+check('withAuth forces TLS certificate verification when credentials are attached',
+    ($opts[CURLOPT_SSL_VERIFYPEER] ?? false) === true && ($opts[CURLOPT_SSL_VERIFYHOST] ?? 0) === 2);
 
 // (e) No auth configured -> withAuth is a no-op.
 $s5 = $ref->newInstanceWithoutConstructor();

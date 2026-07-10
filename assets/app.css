@@ -1222,6 +1222,13 @@ body {
   color: var(--clay);
 }
 
+.footer-version {
+  color: var(--t3);
+  font-family: var(--f-mono, monospace);
+  font-size: .72rem;
+  white-space: nowrap;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .radar::after { animation: none; }
 }

@@ -1,6 +1,7 @@
 <?php
 
 require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/src/GeoIp.php';
 
 /**
  * ScanLogger — simpan setiap scan ke SQLite dan sediakan data untuk dashboard.
@@ -72,6 +73,8 @@ class ScanLogger
                 detected_cms_version TEXT,
                 scan_blocked  INTEGER NOT NULL DEFAULT 0,
                 scan_blocked_type TEXT,
+                waf_vendors   TEXT,
+                waf_signals   TEXT,
                 is_cloudflare INTEGER NOT NULL DEFAULT 0,
                 top_issues    TEXT
             )
@@ -79,11 +82,14 @@ class ScanLogger
 
         $this->ensureColumn('scans', 'client_ip', 'TEXT');
         $this->ensureColumn('scans', 'client_ip_hash', 'TEXT');
+        $this->ensureColumn('scans', 'client_country', 'TEXT');
         $this->ensureColumn('scans', 'tls_protocol', 'TEXT');
         $this->ensureColumn('scans', 'detected_cms', 'TEXT');
         $this->ensureColumn('scans', 'detected_cms_version', 'TEXT');
         $this->ensureColumn('scans', 'scan_blocked', 'INTEGER NOT NULL DEFAULT 0');
         $this->ensureColumn('scans', 'scan_blocked_type', 'TEXT');
+        $this->ensureColumn('scans', 'waf_vendors', 'TEXT');
+        $this->ensureColumn('scans', 'waf_signals', 'TEXT');
         $this->ensureColumn('scans', 'is_cloudflare', 'INTEGER NOT NULL DEFAULT 0');
         $this->ensureColumn('scans', 'top_issues', 'TEXT');
 
@@ -92,6 +98,7 @@ class ScanLogger
         $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_grade      ON scans(grade)");
         $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_client_ip  ON scans(client_ip)");
         $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_ip_hash    ON scans(client_ip_hash)");
+        $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_country    ON scans(client_country)");
     }
 
     private function ensureColumn(string $table, string $column, string $definition): void
@@ -129,17 +136,22 @@ class ScanLogger
             $ipHash = $clientIp !== ''
                 ? hash('sha256', $clientIp . (string)secscan_config('ip_hash_salt'))
                 : null;
+            $clientCountry = $clientIp !== '' ? GeoIp::lookup($this->pdo, $clientIp) : null;
 
             // Parse duration "1.23s" → ms
             $durationMs = (int)(((float)rtrim($result['duration'] ?? '0s', 's')) * 1000);
+            $waf = is_array($result['waf'] ?? null) ? $result['waf'] : [];
+            $wafVendors = array_values(array_filter(array_map('strval', $waf['vendors'] ?? [])));
+            $wafSignals = is_array($waf['signals'] ?? null) ? $waf['signals'] : [];
+            $isCloudflare = ($result['edge']['cloudflare'] ?? false) || in_array('Cloudflare', $wafVendors, true);
 
             $stmt = $this->pdo->prepare("
                 INSERT INTO scans
                     (hostname, url, score, grade, passed, warnings, critical, info,
-                     total_checks, duration_ms, client_ip, client_ip_hash, tls_protocol,
+                     total_checks, duration_ms, client_ip, client_ip_hash, client_country, tls_protocol,
                      detected_cms, detected_cms_version, scan_blocked, scan_blocked_type,
-                     is_cloudflare, top_issues)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     waf_vendors, waf_signals, is_cloudflare, top_issues)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ");
 
             $stmt->execute([
@@ -155,12 +167,15 @@ class ScanLogger
                 $durationMs,
                 $clientIp !== '' ? $clientIp : null,
                 $ipHash,
+                $clientCountry,
                 $result['tls']['protocol']     ?? null,
                 $result['detected_cms']         ?? null,
                 $result['detected_cms_version'] ?? null,
                 !empty($result['scan_blocked']) ? 1 : 0,
                 $result['scan_blocked_type']    ?? null,
-                ($result['edge']['cloudflare'] ?? false) ? 1 : 0,
+                json_encode($wafVendors, JSON_UNESCAPED_UNICODE),
+                json_encode($wafSignals, JSON_UNESCAPED_UNICODE),
+                $isCloudflare ? 1 : 0,
                 json_encode(array_slice($topIssues, 0, 15), JSON_UNESCAPED_UNICODE),
             ]);
         } catch (Throwable $e) {
@@ -186,7 +201,8 @@ class ScanLogger
                     SUM(CASE WHEN grade IN ('A+','A') THEN 1 ELSE 0 END) AS grade_a_count,
                     SUM(critical)                                 AS total_critical,
                     SUM(CASE WHEN critical > 0 THEN 1 ELSE 0 END) AS scans_with_criticals,
-                    SUM(CASE WHEN scan_blocked = 1 THEN 1 ELSE 0 END) AS scan_blocked_total
+                    SUM(CASE WHEN scan_blocked = 1 THEN 1 ELSE 0 END) AS scan_blocked_total,
+                    SUM(CASE WHEN waf_vendors IS NOT NULL AND waf_vendors <> '' AND waf_vendors <> '[]' THEN 1 ELSE 0 END) AS waf_detected_total
                 FROM scans
             ")->fetch();
             return $row ?: [];
@@ -236,6 +252,148 @@ class ScanLogger
         } catch (Throwable) { return []; }
     }
 
+    /** @return array<int,array{country:string,cnt:int,avg_score:float|int|null,last_scan:string}> */
+    public function getCountryStats(int $limit = 20): array
+    {
+        if (!$this->connect()) return [];
+        try {
+            $limit = max(1, min(100, $limit));
+            return $this->pdo->query(
+                "SELECT s.client_country AS country, COUNT(*) AS cnt, ROUND(AVG(s.score), 1) AS avg_score, MAX(s.scanned_at) AS last_scan
+                 FROM scans s
+                 LEFT JOIN scans newer ON newer.hostname = s.hostname
+                    AND (newer.scanned_at > s.scanned_at OR (newer.scanned_at = s.scanned_at AND newer.id > s.id))
+                 WHERE newer.id IS NULL AND s.client_country IS NOT NULL AND s.client_country <> ''
+                 GROUP BY s.client_country
+                 ORDER BY cnt DESC, country ASC
+                 LIMIT {$limit}"
+            )->fetchAll();
+        } catch (Throwable) {
+            return [];
+        }
+    }
+
+    /** Country totals split by grade for interactive dashboard filtering. */
+    public function getCountryGradeStats(): array
+    {
+        if (!$this->connect()) return [];
+        try {
+            return $this->pdo->query(
+                "SELECT s.client_country AS country, s.grade, COUNT(*) AS cnt, ROUND(AVG(s.score), 1) AS avg_score
+                 FROM scans s
+                 LEFT JOIN scans newer ON newer.hostname = s.hostname
+                    AND (newer.scanned_at > s.scanned_at OR (newer.scanned_at = s.scanned_at AND newer.id > s.id))
+                 WHERE newer.id IS NULL AND s.client_country IS NOT NULL AND s.client_country <> ''
+                 GROUP BY s.client_country, s.grade
+                 ORDER BY s.client_country ASC, s.grade ASC"
+            )->fetchAll();
+        } catch (Throwable) {
+            return [];
+        }
+    }
+
+    /** Latest result for each domain, optionally narrowed to one grade. */
+    public function getLatestDomainScans(string $grade = 'all', string $sort = 'recent', int $limit = 25, int $offset = 0): array
+    {
+        if (!$this->connect()) return [];
+        try {
+            $limit = max(1, min(100, $limit));
+            $offset = max(0, $offset);
+            $allowedGrades = ['A+', 'A', 'B', 'C', 'D', 'F'];
+            $filterGrade = in_array($grade, $allowedGrades, true) ? $grade : null;
+            $sql = "SELECT s.hostname, s.url, s.score, s.grade, s.client_country, s.scanned_at,
+                           s.critical, s.warnings
+                    FROM scans s
+                    LEFT JOIN scans newer ON newer.hostname = s.hostname
+                       AND (newer.scanned_at > s.scanned_at OR (newer.scanned_at = s.scanned_at AND newer.id > s.id))
+                    WHERE newer.id IS NULL AND s.hostname IS NOT NULL AND s.hostname <> ''";
+            if ($filterGrade !== null) $sql .= ' AND s.grade = :grade';
+            $orderBy = match ($sort) {
+                'highest' => 's.score DESC, s.scanned_at DESC, s.id DESC',
+                'lowest' => 's.score ASC, s.scanned_at DESC, s.id DESC',
+                default => 's.scanned_at DESC, s.id DESC',
+            };
+            $sql .= " ORDER BY {$orderBy} LIMIT :limit OFFSET :offset";
+            $stmt = $this->pdo->prepare($sql);
+            if ($filterGrade !== null) $stmt->bindValue(':grade', $filterGrade, PDO::PARAM_STR);
+            $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+            $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+            $stmt->execute();
+            return $stmt->fetchAll();
+        } catch (Throwable) {
+            return [];
+        }
+    }
+
+    /** Number of unique domains represented by their latest scan result. */
+    public function getLatestDomainScanCount(string $grade = 'all'): int
+    {
+        if (!$this->connect()) return 0;
+        try {
+            $allowedGrades = ['A+', 'A', 'B', 'C', 'D', 'F'];
+            $filterGrade = in_array($grade, $allowedGrades, true) ? $grade : null;
+            $sql = "SELECT COUNT(*)
+                    FROM scans s
+                    LEFT JOIN scans newer ON newer.hostname = s.hostname
+                       AND (newer.scanned_at > s.scanned_at OR (newer.scanned_at = s.scanned_at AND newer.id > s.id))
+                    WHERE newer.id IS NULL AND s.hostname IS NOT NULL AND s.hostname <> ''";
+            if ($filterGrade !== null) $sql .= ' AND s.grade = :grade';
+            $stmt = $this->pdo->prepare($sql);
+            if ($filterGrade !== null) $stmt->bindValue(':grade', $filterGrade, PDO::PARAM_STR);
+            $stmt->execute();
+            return (int)$stmt->fetchColumn();
+        } catch (Throwable) {
+            return 0;
+        }
+    }
+
+    /** Domain unik mengikut suffix, dengan www. dianggap domain yang sama. */
+    public function getDomainSuffixStats(): array
+    {
+        if (!$this->connect()) return [];
+        try {
+            return $this->pdo->query(
+                "WITH unique_domains AS (
+                    SELECT DISTINCT CASE
+                        WHEN lower(hostname) LIKE 'www.%' THEN substr(lower(hostname), 5)
+                        ELSE lower(hostname)
+                    END AS domain
+                    FROM scans
+                    WHERE hostname IS NOT NULL AND hostname <> ''
+                )
+                SELECT CASE
+                    WHEN domain LIKE '%.edu.my' THEN 'edu_my'
+                    WHEN domain LIKE '%.gov.my' THEN 'gov_my'
+                    WHEN domain LIKE '%.com.my' THEN 'com_my'
+                    WHEN domain LIKE '%.my' THEN 'my_other'
+                    WHEN domain LIKE '%.com' THEN 'com'
+                    WHEN domain LIKE '%.org' THEN 'org'
+                    WHEN domain LIKE '%.net' THEN 'net'
+                    ELSE 'other'
+                END AS category,
+                COUNT(*) AS cnt
+                FROM unique_domains
+                GROUP BY category"
+            )->fetchAll();
+        } catch (Throwable) {
+            return [];
+        }
+    }
+
+    /** @return array{available:bool,records:int,updated_at:string} */
+    public function getGeoIpStatus(): array
+    {
+        return $this->connect() ? GeoIp::status($this->pdo) : ['available' => false, 'records' => 0, 'updated_at' => ''];
+    }
+
+    /** @return array{ok:bool,message:string,records:int,backfilled:int} */
+    public function updateGeoIp(): array
+    {
+        return $this->connect()
+            ? GeoIp::update($this->pdo)
+            : ['ok' => false, 'message' => 'Pangkalan data dashboard tidak dapat dibuka.', 'records' => 0, 'backfilled' => 0];
+    }
+
     public function getTopDomains(int $limit = 10): array
     {
         if (!$this->connect()) return [];
@@ -261,9 +419,21 @@ class ScanLogger
                 SELECT hostname,
                        COUNT(*) AS scan_count,
                        MAX(scanned_at) AS last_scan,
-                       ROUND(AVG(score), 1) AS avg_score
+                       ROUND(AVG(score), 1) AS avg_score,
+                       (
+                           SELECT waf_vendors
+                           FROM scans AS latest
+                           WHERE latest.hostname = scans.hostname
+                             AND latest.waf_vendors IS NOT NULL
+                             AND latest.waf_vendors <> ''
+                             AND latest.waf_vendors <> '[]'
+                           ORDER BY latest.scanned_at DESC
+                           LIMIT 1
+                       ) AS waf_vendors
                 FROM scans
                 WHERE is_cloudflare = 1
+                   OR scan_blocked = 1
+                   OR (waf_vendors IS NOT NULL AND waf_vendors <> '' AND waf_vendors <> '[]')
                 GROUP BY hostname
                 ORDER BY last_scan DESC
                 LIMIT {$limit}
@@ -321,9 +491,9 @@ class ScanLogger
             $offset = max(0, $offset);
             return $this->pdo->query("
                 SELECT id, scanned_at, hostname, score, grade, passed, warnings,
-                       critical, total_checks, duration_ms, client_ip, tls_protocol,
+                       critical, total_checks, duration_ms, client_ip, client_country, tls_protocol,
                        detected_cms, detected_cms_version, scan_blocked, scan_blocked_type,
-                       is_cloudflare
+                       waf_vendors, waf_signals, is_cloudflare
                 FROM scans
                 ORDER BY scanned_at DESC
                 LIMIT {$limit} OFFSET {$offset}

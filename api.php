@@ -27,6 +27,7 @@ header('X-Content-Type-Options: nosniff');
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 header('Pragma: no-cache');
 header('Expires: 0');
+secscan_send_operational_security_headers();
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
@@ -37,7 +38,10 @@ if (!in_array($_SERVER['REQUEST_METHOD'], ['GET', 'POST'], true)) {
     $sendJson(['error' => 'Method not allowed.'], 405);
 }
 
-$rawBody = $_SERVER['REQUEST_METHOD'] === 'POST' ? (file_get_contents('php://input') ?: '') : '';
+$rawBody = $_SERVER['REQUEST_METHOD'] === 'POST' ? secscan_read_request_body() : '';
+if ($rawBody === null) {
+    $sendJson(['error' => 'Request body is too large.'], 413);
+}
 $input = $rawBody !== '' ? (json_decode($rawBody, true) ?: []) : [];
 $urlInput = trim((string)($input['url'] ?? $_POST['url'] ?? $_GET['url'] ?? ''));
 
@@ -47,16 +51,25 @@ if (!$target['ok']) {
 }
 
 $clientIp = secscan_client_ip();
-$rate = RateLimiter::consume(
-    'api_v2',
-    $clientIp,
-    (int)secscan_config('api_rate_limit'),
-    (int)secscan_config('api_rate_window')
-);
+if (secscan_is_owner_bypass_ip($clientIp)) {
+    $rate = ['allowed' => true, 'limit' => 'bypass', 'remaining' => 'bypass', 'reset' => time(), 'retry_after' => 0, 'storage_failed' => false];
+    header('X-RateLimit-Bypass: owner-ip');
+} else {
+    $rate = RateLimiter::consume(
+        'scan_v5',
+        $clientIp,
+        (int)secscan_config('scan_rate_limit'),
+        (int)secscan_config('scan_rate_window')
+    );
+}
 
 header('X-RateLimit-Limit: ' . $rate['limit']);
 header('X-RateLimit-Remaining: ' . $rate['remaining']);
 header('X-RateLimit-Reset: ' . $rate['reset']);
+
+if (!empty($rate['storage_failed'])) {
+    $sendJson(['error' => 'Rate-limit service is unavailable. Please try again later.'], 503);
+}
 
 if (!$rate['allowed']) {
     header('Retry-After: ' . $rate['retry_after']);
@@ -78,6 +91,9 @@ try {
         $authHeaders = $input['auth_headers'] ?? [];
         if (!is_array($authHeaders)) $authHeaders = [];
         if ($authCookie !== '' || $authHeaders !== []) {
+            if (($target['scheme'] ?? '') !== 'https') {
+                $sendJson(['error' => 'Authenticated scanning requires a valid HTTPS URL.'], 400);
+            }
             $scanner->setAuth($authHeaders, $authCookie);
         }
     }
@@ -110,6 +126,7 @@ try {
     $result['request'] = [
         'client_ip' => $clientIp,
     ];
+    $result['scanner_identity'] = secscan_scanner_identity();
 
     $sendJson($result);
 } catch (Throwable $e) {

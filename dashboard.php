@@ -13,6 +13,7 @@ define('DASHBOARD_PASSWORD_HASH', (string)secscan_config('dashboard_password_has
 
 define('SESSION_NAME',    'secscan_dash');
 define('SESSION_TIMEOUT', 3600); // 1 jam
+$appVersion = secscan_app_version();
 
 // ----------------------------------------------------------------
 //  Bootstrap
@@ -34,12 +35,20 @@ session_set_cookie_params([
     'samesite' => 'Lax',
 ]);
 session_start();
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
 
 // Expire session selepas SESSION_TIMEOUT saat
 if (isset($_SESSION['last_active']) && (time() - $_SESSION['last_active']) > SESSION_TIMEOUT) {
+    secscan_forget_owner_bypass_ip((string)($_SESSION['owner_bypass_ip'] ?? secscan_client_ip()));
     session_unset(); session_destroy(); session_start();
 }
-if (isset($_SESSION['auth'])) $_SESSION['last_active'] = time();
+if (isset($_SESSION['auth'])) {
+    $_SESSION['last_active'] = time();
+    $_SESSION['owner_bypass_ip'] = secscan_client_ip();
+    secscan_remember_owner_bypass_ip((string)$_SESSION['owner_bypass_ip'], SESSION_TIMEOUT);
+}
 
 $isLoggedIn = ($_SESSION['auth'] ?? false) === true;
 $loginError = '';
@@ -50,8 +59,11 @@ if (!$isLoggedIn && $setupError !== '') {
     $loginError = $setupError;
 }
 
-// Handle logout
-if (isset($_GET['logout'])) {
+// Logout changes session and rate-bypass state, so require a CSRF-protected POST.
+if ($requestMethod === 'POST' && isset($_POST['logout'])
+    && is_string($_POST['csrf_token'] ?? null)
+    && hash_equals((string)$_SESSION['csrf_token'], $_POST['csrf_token'])) {
+    secscan_forget_owner_bypass_ip((string)($_SESSION['owner_bypass_ip'] ?? secscan_client_ip()));
     session_unset(); session_destroy();
     header('Location: dashboard.php'); exit;
 }
@@ -61,16 +73,25 @@ if ($requestMethod === 'POST' && !$isLoggedIn) {
     $loginRate = RateLimiter::consume('dashboard_login_v1', secscan_client_ip(), 10, 900);
     if ($setupError !== '') {
         $loginError = $setupError;
+    } elseif (!empty($loginRate['storage_failed'])) {
+        http_response_code(503);
+        $loginError = 'Perkhidmatan rate limit tidak tersedia. Cuba semula kemudian.';
     } elseif (!$loginRate['allowed']) {
         $loginError = 'Terlalu banyak cubaan login. Cuba semula kemudian.';
         header('Retry-After: ' . $loginRate['retry_after']);
     }
 
-    $pw = $_POST['password'] ?? '';
-    if ($loginError === '' && $pw !== '' && password_verify($pw, DASHBOARD_PASSWORD_HASH)) {
+    $pw = is_string($_POST['password'] ?? null) ? $_POST['password'] : '';
+    $csrfValid = is_string($_POST['csrf_token'] ?? null)
+        && hash_equals((string)$_SESSION['csrf_token'], $_POST['csrf_token']);
+    if ($loginError === '' && !$csrfValid) {
+        $loginError = 'Request tidak sah. Sila cuba semula.';
+    } elseif ($loginError === '' && $pw !== '' && password_verify($pw, DASHBOARD_PASSWORD_HASH)) {
         session_regenerate_id(true);
         $_SESSION['auth']        = true;
         $_SESSION['last_active'] = time();
+        $_SESSION['owner_bypass_ip'] = secscan_client_ip();
+        secscan_remember_owner_bypass_ip((string)$_SESSION['owner_bypass_ip'], SESSION_TIMEOUT);
         $isLoggedIn = true;
         header('Location: dashboard.php'); exit;
     } elseif ($loginError === '') {
@@ -89,7 +110,8 @@ header('X-Content-Type-Options: nosniff');
 header('X-Frame-Options: DENY');
 header('Referrer-Policy: no-referrer');
 header('Cache-Control: no-store, private, max-age=0');
-header("Content-Security-Policy: default-src 'self'; script-src 'nonce-{$nonce}'; style-src 'self' 'nonce-{$nonce}'; style-src-attr 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'");
+header("Content-Security-Policy: default-src 'self'; form-action 'self'; script-src 'nonce-{$nonce}' https://cdn.jsdelivr.net; style-src 'self' 'nonce-{$nonce}' https://cdn.jsdelivr.net; style-src-attr 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; report-to default; report-uri /reporting.php");
+secscan_send_operational_security_headers();
 
 if ($isHttps) {
     header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
@@ -109,14 +131,39 @@ $peakHours   = [];
 $recentScans = [];
 $totalCount  = 0;
 $scoreDist   = [];
+$countryStats = [];
+$countryGradeStats = [];
+$domainSuffixStats = [];
+$latestDomainScans = [];
+$latestDomainCount = 0;
+$domainListPageSize = 25;
+$domainListGradeOptions = ['all', 'A+', 'A', 'B', 'C', 'D', 'F'];
+$domainListGrade = (string)($_GET['domain_grade'] ?? 'all');
+if (!in_array($domainListGrade, $domainListGradeOptions, true)) $domainListGrade = 'all';
+$domainListSort = (string)($_GET['domain_sort'] ?? 'recent');
+if (!in_array($domainListSort, ['recent', 'highest', 'lowest'], true)) $domainListSort = 'recent';
+$domainListPage = max(1, (int)($_GET['domains_p'] ?? 1));
+$geoIpStatus = ['available' => false, 'records' => 0, 'updated_at' => ''];
+$geoIpMessage = '';
+$geoIpMessageTone = '';
+$logger = null;
 $pageSize    = 50;
 $page        = max(1, (int)($_GET['p'] ?? 1));
+$currentClientIp = secscan_client_ip();
 
 if ($isLoggedIn) {
     $loggerPath = __DIR__ . '/logger.php';
     if (is_file($loggerPath)) {
         require_once $loggerPath;
         $logger      = new ScanLogger();
+        if ($requestMethod === 'POST' && isset($_POST['geoip_update'])
+            && is_string($_POST['csrf_token'] ?? null)
+            && hash_equals((string)$_SESSION['csrf_token'], $_POST['csrf_token'])) {
+            set_time_limit(300);
+            $update = $logger->updateGeoIp();
+            $geoIpMessage = (string)$update['message'];
+            $geoIpMessageTone = !empty($update['ok']) ? 'good' : 'bad';
+        }
         $summary     = $logger->getSummary();
         $grades      = $logger->getGradeDistribution();
         $dailyScans  = $logger->getDailyScans(30);
@@ -127,6 +174,12 @@ if ($isLoggedIn) {
         $totalCount  = $logger->getTotalCount();
         $scoreDist   = $logger->getScoreDistribution();
         $recentScans = $logger->getRecentScans($pageSize, ($page - 1) * $pageSize);
+        $countryStats = $logger->getCountryStats(24);
+        $countryGradeStats = $logger->getCountryGradeStats();
+        $domainSuffixStats = $logger->getDomainSuffixStats();
+        $latestDomainCount = $logger->getLatestDomainScanCount($domainListGrade);
+        $latestDomainScans = $logger->getLatestDomainScans($domainListGrade, $domainListSort, $domainListPageSize, ($domainListPage - 1) * $domainListPageSize);
+        $geoIpStatus = $logger->getGeoIpStatus();
     }
 }
 
@@ -175,6 +228,38 @@ function relTime(string $dt): string {
     return (int)($diff / 86400) . 'd ago';
 }
 
+function wafVendorsFromRow(array $row): array {
+    $raw = trim((string)($row['waf_vendors'] ?? ''));
+    $vendors = [];
+    if ($raw !== '') {
+        $decoded = json_decode($raw, true);
+        if (is_array($decoded)) {
+            $vendors = array_values(array_filter(array_map('strval', $decoded)));
+        }
+    }
+    if ($vendors === [] && (int)($row['is_cloudflare'] ?? 0) === 1) {
+        $vendors[] = 'Cloudflare';
+    }
+    return array_values(array_unique($vendors));
+}
+
+function wafLabelFromRow(array $row): string {
+    $vendors = wafVendorsFromRow($row);
+    if ($vendors !== []) {
+        return implode(', ', array_slice($vendors, 0, 2));
+    }
+    return (int)($row['scan_blocked'] ?? 0) === 1 ? 'Blocked' : 'Direct';
+}
+
+function countryLabel(string $code): string {
+    $code = strtoupper(trim($code));
+    if (class_exists('Locale')) {
+        $label = Locale::getDisplayRegion('-' . $code, 'en');
+        if (is_string($label) && $label !== '' && $label !== $code) return $label;
+    }
+    return $code;
+}
+
 $totalPages = (int)ceil($totalCount / $pageSize);
 $totalScans = (int)($summary['total_scans'] ?? 0);
 $avgScore = is_numeric($summary['avg_score'] ?? null) ? (float)$summary['avg_score'] : null;
@@ -183,6 +268,13 @@ $criticalTotal = (int)($summary['total_critical'] ?? 0);
 $criticalScans = (int)($summary['scans_with_criticals'] ?? 0);
 $uniqueIps = (int)($summary['unique_ips'] ?? 0);
 $domainTotal = count($topDomains);
+$domainSuffixMap = array_fill_keys(['edu_my', 'gov_my', 'com_my', 'my_other', 'com', 'org', 'net', 'other'], 0);
+foreach ($domainSuffixStats as $row) {
+    $category = (string)($row['category'] ?? '');
+    if (array_key_exists($category, $domainSuffixMap)) $domainSuffixMap[$category] = (int)($row['cnt'] ?? 0);
+}
+$uniqueDomainTotal = array_sum($domainSuffixMap);
+$domainListPages = (int)ceil($latestDomainCount / $domainListPageSize);
 $blockedProbes = (int)($summary['scan_blocked_total'] ?? 0);
 if ($blockedProbes === 0) {
     $blockedProbes = array_reduce($recentScans, static fn($sum, $scan) => $sum + ((int)($scan['scan_blocked'] ?? 0) === 1 ? 1 : 0), 0);
@@ -190,7 +282,7 @@ if ($blockedProbes === 0) {
 if ($cdnDomains === []) {
     $cdnMap = [];
     foreach ($recentScans as $scan) {
-        if ((int)($scan['is_cloudflare'] ?? 0) !== 1) continue;
+        if ((int)($scan['is_cloudflare'] ?? 0) !== 1 && (int)($scan['scan_blocked'] ?? 0) !== 1 && wafVendorsFromRow($scan) === []) continue;
         $host = (string)($scan['hostname'] ?? '');
         if ($host === '') continue;
         if (!isset($cdnMap[$host])) {
@@ -199,6 +291,7 @@ if ($cdnDomains === []) {
                 'scan_count' => 0,
                 'last_scan' => (string)($scan['scanned_at'] ?? ''),
                 'avg_score' => 0,
+                'waf_vendors' => (string)($scan['waf_vendors'] ?? ''),
                 '_score_sum' => 0,
             ];
         }
@@ -206,6 +299,7 @@ if ($cdnDomains === []) {
         $cdnMap[$host]['_score_sum'] += (float)($scan['score'] ?? 0);
         if (strcmp((string)($scan['scanned_at'] ?? ''), (string)$cdnMap[$host]['last_scan']) > 0) {
             $cdnMap[$host]['last_scan'] = (string)$scan['scanned_at'];
+            $cdnMap[$host]['waf_vendors'] = (string)($scan['waf_vendors'] ?? '');
         }
     }
     foreach ($cdnMap as &$row) {
@@ -249,6 +343,11 @@ $readiness = [
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>SecScan Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg"/>
+<link rel="shortcut icon" href="favicon.svg"/>
+<?php if (!empty($countryStats)): ?>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/jsvectormap@1.7.0/dist/jsvectormap.min.css" referrerpolicy="no-referrer"/>
+<?php endif; ?>
 <style nonce="<?= htmlspecialchars($nonce, ENT_QUOTES) ?>">
 :root {
   --base: #f4f7fb; --surface: #ffffff; --elevated: #eef4fa; --high: #e4edf6;
@@ -293,6 +392,7 @@ body { font-family: var(--f-title); background:
        color: var(--t1); min-height: 100vh; overflow-x: hidden; }
 a { color: var(--mint); text-decoration: none; }
 button, input { font-family: inherit; }
+.sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
 
 /* ── Header ── */
 .topbar { position: sticky; top: 0; z-index: 100;
@@ -347,6 +447,22 @@ button, input { font-family: inherit; }
 .login-error { font-size: .72rem; color: #fda4af; background: rgba(244,63,94,.08);
                border: 1px solid rgba(244,63,94,.2); border-radius: var(--r-sm);
                padding: 10px 14px; margin-bottom: 16px; text-align: center; }
+.login-notice { border: 1px solid rgba(244,63,94,.25); background: rgba(244,63,94,.07);
+                border-radius: var(--r-sm); padding: 12px 14px; margin: 0 0 18px;
+                color: var(--t2); font-size: .78rem; line-height: 1.5; text-align: center; }
+.login-notice strong { display: block; color: #fda4af; font-family: var(--f-title);
+                       font-size: .78rem; letter-spacing: .08em; margin-bottom: 4px; text-transform: uppercase; }
+.login-ip { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+            margin: 0 0 16px; padding: 10px 12px; border: 1px solid var(--border2);
+            border-radius: var(--r-sm); background: var(--elevated); color: var(--t2);
+            font-size: .72rem; }
+.login-ip span { font-family: var(--f-title); font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.login-ip code { color: var(--t1); font-family: var(--f-mono); font-size: .78rem; overflow-wrap: anywhere; }
+.login-back { display: inline-flex; align-items: center; justify-content: center; width: 100%;
+              min-height: 36px; margin-top: 14px; border: 1px solid var(--border2);
+              border-radius: var(--r-sm); color: var(--t2); text-decoration: none;
+              font-family: var(--f-title); font-size: .75rem; font-weight: 700; }
+.login-back:hover { color: var(--t1); border-color: var(--border3); background: var(--elevated); }
 
 /* ── Main layout ── */
 .main { max-width: 1280px; margin: 0 auto; padding: 32px 24px 80px; }
@@ -451,6 +567,30 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
 .sd-label { font-size: .55rem; color: var(--t3); letter-spacing: .08em; margin-top: 4px; }
 
 .no-data  { color: var(--t3); font-size: .72rem; padding: 24px; text-align: center; }
+
+/* ── GeoIP country map ── */
+.geoip-layout { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(220px, .8fr); gap: 14px; }
+.geoip-controls { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 7px; }
+.geoip-select { min-height: 32px; padding: 0 28px 0 9px; border: 1px solid var(--border2); border-radius: var(--r-sm); background: var(--surface); color: var(--t1); font: inherit; font-size: .7rem; }
+.geoip-map { min-height: 270px; border: 1px solid var(--border); border-radius: var(--r-sm); background: color-mix(in srgb, var(--elevated) 72%, var(--base)); overflow: hidden; }
+.geoip-map .jvm-container { background: transparent !important; }
+.geoip-map .jvm-zoom-btn { display: none; }
+.geoip-map .jvm-tooltip { background: var(--t1); color: var(--surface); border-radius: 6px; font-family: var(--f-title); font-size: .72rem; padding: 6px 8px; }
+.geoip-countries { display: grid; align-content: start; gap: 8px; max-height: 270px; overflow: auto; padding-right: 2px; }
+.geoip-country { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 9px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--elevated); }
+.geoip-country strong { font-size: .78rem; }
+.geoip-country span { color: var(--t2); font-size: .68rem; }
+.geoip-meta { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-top: 12px; color: var(--t2); font-size: .7rem; }
+.geoip-message { margin-top: 10px; padding: 9px 10px; border-radius: var(--r-sm); font-size: .72rem; }
+.geoip-message.good { background: var(--mint2); color: var(--mint); border: 1px solid color-mix(in srgb, var(--mint) 34%, var(--border)); }
+.geoip-message.bad { background: color-mix(in srgb, var(--rose) 10%, var(--surface)); color: var(--rose); border: 1px solid color-mix(in srgb, var(--rose) 35%, var(--border)); }
+.geoip-update { white-space: nowrap; }
+
+/* ── Domain suffix statistics ── */
+.domain-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; }
+.domain-stat { padding: 11px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--elevated); }
+.domain-stat span { display:block; color: var(--t2); font-family: var(--f-mono); font-size: .68rem; }
+.domain-stat strong { display:block; margin-top: 4px; font-size: 1.2rem; }
 
 /* Enterprise dashboard redesign */
 .enterprise-shell {
@@ -620,6 +760,15 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
   justify-content: flex-end;
   gap: 10px;
   flex-wrap: wrap;
+}
+.app-version {
+  color: var(--t2);
+  font-family: var(--f-mono);
+  font-size: .72rem;
+  font-weight: 700;
+  letter-spacing: .04em;
+  padding: 0 2px;
+  white-space: nowrap;
 }
 .theme-control {
   display: grid;
@@ -998,6 +1147,8 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
   .top-actions { justify-content: flex-start; }
   .metrics { grid-template-columns: 1fr; }
   .heatmap { grid-template-columns: repeat(2, 1fr); }
+  .geoip-layout { grid-template-columns: 1fr; }
+  .domain-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .readiness-row { grid-template-columns: 94px minmax(0, 1fr) 34px; }
   .event { grid-template-columns: auto minmax(0, 1fr); }
   .event time { grid-column: 2; }
@@ -1015,16 +1166,26 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
     </div>
     <div class="login-title">SecScan Dashboard</div>
     <div class="login-sub">ADMIN ACCESS ONLY</div>
+    <div class="login-notice">
+      <strong>Unauthorized access</strong>
+      Akses dashboard ini hanya untuk pentadbir yang diberi kebenaran.
+    </div>
+    <div class="login-ip">
+      <span>IP anda</span>
+      <code><?= htmlspecialchars($currentClientIp, ENT_QUOTES) ?></code>
+    </div>
     <?php if ($loginError): ?>
       <div class="login-error"><?= htmlspecialchars($loginError) ?></div>
     <?php endif; ?>
     <form method="POST" autocomplete="off">
+      <input type="hidden" name="csrf_token" value="<?= htmlspecialchars((string)$_SESSION['csrf_token'], ENT_QUOTES) ?>"/>
       <div class="field">
         <label>PASSWORD</label>
         <input type="password" name="password" autofocus required placeholder="••••••••••••"/>
       </div>
       <button class="btn-login" type="submit">MASUK →</button>
     </form>
+    <a class="login-back" href="index.php">Kembali ke scanner</a>
   </div>
 </div>
 
@@ -1065,12 +1226,16 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
         <strong>Enterprise Dashboard</strong>
       </div>
       <div class="top-actions">
+        <span class="app-version" title="Versi aplikasi">v<?= htmlspecialchars($appVersion, ENT_QUOTES, 'UTF-8') ?></span>
         <a class="nav-link" href="dashboard.php">Dashboard</a>
         <div class="theme-control" role="group" aria-label="Theme">
           <button class="theme-choice" type="button" data-theme-choice="light">Light</button>
           <button class="theme-choice" type="button" data-theme-choice="dark">Dark</button>
         </div>
-        <a class="nav-link" href="?logout=1">Log Keluar</a>
+        <form method="POST" class="nav-link-form">
+          <input type="hidden" name="csrf_token" value="<?= htmlspecialchars((string)$_SESSION['csrf_token'], ENT_QUOTES) ?>"/>
+          <button class="nav-link btn-logout" type="submit" name="logout" value="1">Log Keluar</button>
+        </form>
       </div>
     </header>
 
@@ -1080,6 +1245,8 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
         <p>Monitor scan activity, blocked probes, high-risk findings, CMS exposure, PCI readiness, and scanner IP accountability.</p>
       </div>
       <div class="dashboard-actions">
+        <button class="secondary-action" type="button" id="autoRefreshToggleBtn" aria-pressed="false">Auto Refresh: Off</button>
+        <button class="secondary-action" type="button" id="refreshDashboardBtn">Muat Semula Data</button>
         <button class="secondary-action" type="button" id="exportCsvBtn">Export CSV</button>
         <button class="secondary-action" type="button" id="auditPrintBtn">Generate Audit PDF</button>
         <a class="primary-action" href="index.php">New Scan</a>
@@ -1144,6 +1311,152 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
         <article class="panel">
           <div class="panel-head">
             <div>
+              <h2 class="panel-title">Statistik Domain</h2>
+              <p class="panel-sub"><?= number_format($uniqueDomainTotal) ?> domain unik. Subdomain <code>www.</code> dikira sebagai domain yang sama.</p>
+            </div>
+            <span class="pill info">Inventori</span>
+          </div>
+          <div class="domain-stats">
+            <?php foreach ([
+              'edu_my' => '.edu.my', 'gov_my' => '.gov.my', 'com_my' => '.com.my', 'my_other' => '.my lain',
+              'com' => '.com', 'org' => '.org', 'net' => '.net', 'other' => 'Lain-lain',
+            ] as $key => $label): ?>
+              <div class="domain-stat"><span><?= htmlspecialchars($label) ?></span><strong><?= number_format((int)$domainSuffixMap[$key]) ?></strong></div>
+            <?php endforeach; ?>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2 class="panel-title">Peta Negara Scanner</h2>
+              <p class="panel-sub">Domain unik sahaja; setiap domain menggunakan lokasi, gred, dan skor daripada scan paling baharu.</p>
+            </div>
+            <span class="pill <?= !empty($geoIpStatus['available']) ? 'good' : 'warn' ?>"><?= !empty($geoIpStatus['available']) ? 'GeoIP aktif' : 'GeoIP belum dimuat' ?></span>
+          </div>
+
+          <?php if ($geoIpMessage !== ''): ?>
+            <div class="geoip-message <?= htmlspecialchars($geoIpMessageTone) ?>"><?= htmlspecialchars($geoIpMessage) ?></div>
+          <?php endif; ?>
+
+          <?php if (!empty($countryStats)): ?>
+            <div class="geoip-controls" aria-label="Penapis peta negara">
+              <label class="sr-only" for="geoGradeFilter">Tapis gred</label>
+              <select class="geoip-select" id="geoGradeFilter">
+                <option value="all">Semua gred</option>
+                <option value="A+">Gred A+</option>
+                <option value="A">Gred A</option>
+                <option value="B">Gred B</option>
+                <option value="C">Gred C</option>
+                <option value="D">Gred D</option>
+                <option value="F">Gred F</option>
+              </select>
+              <label class="sr-only" for="geoMetricFilter">Ukuran peta</label>
+              <select class="geoip-select" id="geoMetricFilter">
+                <option value="count">Jumlah scan</option>
+                <option value="best">Skor tertinggi</option>
+                <option value="worst">Skor terendah</option>
+              </select>
+            </div>
+            <div class="geoip-layout">
+              <div id="geoCountryMap" class="geoip-map" aria-label="Peta dunia mengikut negara scanner"></div>
+              <div class="geoip-countries" id="geoCountryList" aria-label="Negara scanner utama">
+                <?php foreach (array_slice($countryStats, 0, 10) as $country): ?>
+                  <div class="geoip-country">
+                    <div><strong><?= htmlspecialchars(countryLabel((string)$country['country'])) ?></strong><br><span><?= htmlspecialchars((string)$country['country']) ?> · skor <?= htmlspecialchars((string)$country['avg_score']) ?></span></div>
+                    <strong><?= number_format((int)$country['cnt']) ?> domain</strong>
+                  </div>
+                <?php endforeach; ?>
+              </div>
+            </div>
+            <script type="application/json" id="geoCountryData"><?= json_encode($countryGradeStats, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?></script>
+          <?php else: ?>
+            <div class="empty-state">Belum ada lokasi negara. Muat turun GeoIP, kemudian scan baharu akan dipetakan; rekod sedia ada turut diproses semula semasa kemas kini.</div>
+          <?php endif; ?>
+
+          <div class="geoip-meta">
+            <span>
+              <?php if (!empty($geoIpStatus['available'])): ?>
+                <?= number_format((int)$geoIpStatus['records']) ?> rekod GeoIP · dikemas kini <?= htmlspecialchars((string)$geoIpStatus['updated_at']) ?>
+              <?php else: ?>
+                Pangkalan GeoIP country-level diperlukan untuk memaparkan peta.
+              <?php endif; ?>
+              · <a href="https://db-ip.com" target="_blank" rel="noopener noreferrer">IP Geolocation by DB-IP</a>
+            </span>
+            <form method="POST" id="geoIpUpdateForm">
+              <input type="hidden" name="csrf_token" value="<?= htmlspecialchars((string)$_SESSION['csrf_token'], ENT_QUOTES) ?>"/>
+              <button class="secondary-action geoip-update" id="geoIpUpdateBtn" type="submit" name="geoip_update" value="1">Kemas kini GeoIP pada server</button>
+            </form>
+          </div>
+          <p class="panel-sub" style="margin-top:8px">Fail GeoIP dimuat turun dan disimpan pada server, bukan ke komputer pelayar. Proses pertama boleh mengambil beberapa minit.</p>
+        </article>
+
+        <article class="panel" id="domain-grade-list">
+          <div class="panel-head">
+            <div>
+              <h2 class="panel-title">Senarai Web Mengikut Gred</h2>
+              <p class="panel-sub">Hanya satu rekod paling baharu bagi setiap domain dipaparkan.</p>
+            </div>
+            <form method="GET" class="geoip-controls" id="domainGradeFilterForm" aria-label="Tapis senarai web mengikut gred">
+              <?php if ($page > 1): ?><input type="hidden" name="p" value="<?= $page ?>"/><?php endif; ?>
+              <label class="sr-only" for="domainGradeFilter">Tapis senarai web mengikut gred</label>
+              <select class="geoip-select" id="domainGradeFilter" name="domain_grade">
+                <option value="all"<?= $domainListGrade === 'all' ? ' selected' : '' ?>>Semua gred</option>
+                <?php foreach (['A+', 'A', 'B', 'C', 'D', 'F'] as $grade): ?>
+                  <option value="<?= htmlspecialchars($grade, ENT_QUOTES) ?>"<?= $domainListGrade === $grade ? ' selected' : '' ?>>Gred <?= htmlspecialchars($grade) ?></option>
+                <?php endforeach; ?>
+              </select>
+              <label class="sr-only" for="domainSortFilter">Susun senarai web</label>
+              <select class="geoip-select" id="domainSortFilter" name="domain_sort">
+                <option value="recent"<?= $domainListSort === 'recent' ? ' selected' : '' ?>>Scan terkini</option>
+                <option value="highest"<?= $domainListSort === 'highest' ? ' selected' : '' ?>>Skor tertinggi</option>
+                <option value="lowest"<?= $domainListSort === 'lowest' ? ' selected' : '' ?>>Skor terendah</option>
+              </select>
+            </form>
+          </div>
+          <?php if (!empty($latestDomainScans)): ?>
+            <div class="table-wrap">
+              <table class="enterprise-table" aria-label="Senarai domain terkini mengikut gred">
+                <thead><tr><th>Domain</th><th>Gred</th><th>Skor</th><th>Negara Scanner</th><th>Scan Terkini</th><th>Aksi</th></tr></thead>
+                <tbody>
+                  <?php foreach ($latestDomainScans as $domainScan):
+                    $host = (string)$domainScan['hostname'];
+                    $targetUrl = (string)($domainScan['url'] ?? '');
+                    if (!preg_match('#^https?://#i', $targetUrl)) $targetUrl = 'https://' . $host;
+                    $rescanUrl = 'index.php?url=' . rawurlencode($targetUrl) . '&rescan=1';
+                    $gradeClass = match((string)$domainScan['grade']) {
+                      'A+', 'A', 'B' => 'good', 'C', 'D' => 'warn', 'F' => 'bad', default => 'info',
+                    };
+                  ?>
+                  <tr>
+                    <td><div class="domain"><strong><?= htmlspecialchars($host) ?></strong><a class="target-url" href="<?= htmlspecialchars($targetUrl) ?>" target="_blank" rel="noopener noreferrer"><?= htmlspecialchars($targetUrl) ?></a></div></td>
+                    <td><span class="pill <?= $gradeClass ?>"><?= htmlspecialchars((string)$domainScan['grade']) ?></span></td>
+                    <td><strong><?= number_format((int)$domainScan['score']) ?></strong></td>
+                    <td><?= htmlspecialchars(!empty($domainScan['client_country']) ? countryLabel((string)$domainScan['client_country']) : '-') ?></td>
+                    <td><?= htmlspecialchars(relTime((string)$domainScan['scanned_at'])) ?></td>
+                    <td><a class="rescan-link" href="<?= htmlspecialchars($rescanUrl) ?>">Rescan</a></td>
+                  </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            </div>
+            <?php if ($domainListPages > 1): ?>
+              <div class="pagination">
+                <?php if ($domainListPage > 1): ?><a href="?domain_grade=<?= rawurlencode($domainListGrade) ?>&amp;domain_sort=<?= rawurlencode($domainListSort) ?>&amp;domains_p=<?= $domainListPage - 1 ?>#domain-grade-list"><div class="pg-btn">Sebelum</div></a><?php endif; ?>
+                <?php for ($i = max(1, $domainListPage - 2), $end = min($domainListPages, $domainListPage + 2); $i <= $end; $i++): ?>
+                  <a href="?domain_grade=<?= rawurlencode($domainListGrade) ?>&amp;domain_sort=<?= rawurlencode($domainListSort) ?>&amp;domains_p=<?= $i ?>#domain-grade-list"><div class="pg-btn <?= $i === $domainListPage ? 'active' : '' ?>"><?= $i ?></div></a>
+                <?php endfor; ?>
+                <?php if ($domainListPage < $domainListPages): ?><a href="?domain_grade=<?= rawurlencode($domainListGrade) ?>&amp;domain_sort=<?= rawurlencode($domainListSort) ?>&amp;domains_p=<?= $domainListPage + 1 ?>#domain-grade-list"><div class="pg-btn">Seterusnya</div></a><?php endif; ?>
+              </div>
+            <?php endif; ?>
+          <?php else: ?>
+            <div class="empty-state">Tiada domain dengan gred <?= htmlspecialchars($domainListGrade === 'all' ? 'yang dipilih' : $domainListGrade) ?>.</div>
+          <?php endif; ?>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
               <h2 class="panel-title">Recent Authorized Scans</h2>
               <p class="panel-sub">Every scan keeps target, IP pengguna, grade, CMS, and block status.</p>
             </div>
@@ -1156,8 +1469,9 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
                 <tr>
                   <th>Target</th>
                   <th>Scanner IP</th>
+                  <th>Negara</th>
                   <th>CMS</th>
-                  <th>CDN</th>
+                  <th>WAF</th>
                   <th>Grade</th>
                   <th>Status</th>
                   <th>Time</th>
@@ -1176,7 +1490,7 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
                   } elseif ((int)$s['critical'] > 0) {
                       $statusText = 'Critical';
                       $statusTone = 'bad';
-                  } elseif ((int)$s['is_cloudflare'] === 1) {
+                  } elseif (wafVendorsFromRow($s) !== []) {
                       $statusText = 'WAF';
                       $statusTone = 'warn';
                   } elseif ((int)$s['warnings'] > 0) {
@@ -1200,6 +1514,8 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
                   } else {
                       $cmsText = 'Unknown';
                   }
+                  $wafText = wafLabelFromRow($s);
+                  $wafTone = $wafText === 'Direct' ? 'info' : 'warn';
                 ?>
                 <tr>
                   <td>
@@ -1209,8 +1525,9 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
                     </div>
                   </td>
                   <td><strong><?= htmlspecialchars($s['client_ip'] ?: '-') ?></strong></td>
+                  <td><?= htmlspecialchars(!empty($s['client_country']) ? countryLabel((string)$s['client_country']) : '-') ?></td>
                   <td><?= htmlspecialchars($cmsText) ?></td>
-                  <td><span class="pill <?= (int)$s['is_cloudflare'] === 1 ? 'warn' : 'info' ?>"><?= (int)$s['is_cloudflare'] === 1 ? 'Cloudflare' : 'Direct' ?></span></td>
+                  <td><span class="pill <?= $wafTone ?>"><?= htmlspecialchars($wafText) ?></span></td>
                   <td><span class="pill <?= $gradeClass ?>"><?= htmlspecialchars($s['grade']) ?></span></td>
                   <td><span class="pill <?= $statusTone ?>"><?= htmlspecialchars($statusText) ?></span></td>
                   <td><?= htmlspecialchars(relTime($s['scanned_at'])) ?></td>
@@ -1247,13 +1564,15 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
           <div class="panel-head">
             <div>
               <h2 class="panel-title">CDN / Edge Coverage</h2>
-              <p class="panel-sub">Domain yang dikesan melalui CDN atau edge protection.</p>
+              <p class="panel-sub">Domain yang dikesan melalui WAF, CDN, atau edge protection.</p>
             </div>
             <span class="pill warn"><?= number_format($cdnDomainTotal) ?> domain</span>
           </div>
           <div class="cdn-list">
             <?php if (!empty($cdnDomains)): ?>
-              <?php foreach ($cdnDomains as $cdn): ?>
+              <?php foreach ($cdnDomains as $cdn):
+                $providerLabel = wafLabelFromRow($cdn);
+              ?>
               <div class="cdn-row">
                 <div class="cdn-domain">
                   <strong><?= htmlspecialchars($cdn['hostname']) ?></strong>
@@ -1261,12 +1580,12 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
                 </div>
                 <div class="cdn-provider">
                   <span class="cdn-dot" aria-hidden="true"></span>
-                  <span class="pill warn">Cloudflare</span>
+                  <span class="pill <?= $providerLabel === 'Direct' ? 'info' : 'warn' ?>"><?= htmlspecialchars($providerLabel) ?></span>
                 </div>
               </div>
               <?php endforeach; ?>
             <?php else: ?>
-              <div class="empty-state">Belum ada domain CDN direkodkan.</div>
+              <div class="empty-state">Belum ada domain WAF/CDN direkodkan.</div>
             <?php endif; ?>
           </div>
         </article>
@@ -1344,6 +1663,10 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
   </main>
 </div>
 
+<?php if (!empty($countryStats)): ?>
+<script src="https://cdn.jsdelivr.net/npm/jsvectormap@1.7.0/dist/jsvectormap.min.js" referrerpolicy="no-referrer"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsvectormap@1.7.0/dist/maps/world.js" referrerpolicy="no-referrer"></script>
+<?php endif; ?>
 <script nonce="<?= htmlspecialchars($nonce, ENT_QUOTES) ?>">
 // Theme toggle ikut mockup enterprise.
 (function () {
@@ -1377,6 +1700,8 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
 
   var exportBtn = document.getElementById('exportCsvBtn');
   var auditPrintBtn = document.getElementById('auditPrintBtn');
+  var refreshDashboardBtn = document.getElementById('refreshDashboardBtn');
+  var autoRefreshToggleBtn = document.getElementById('autoRefreshToggleBtn');
   var table = document.getElementById('recentScanTable');
   var shell = document.querySelector('.enterprise-shell');
   var sidebarToggle = document.getElementById('sidebarToggle');
@@ -1430,10 +1755,133 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
       window.print();
     });
   }
+  if (refreshDashboardBtn) {
+    refreshDashboardBtn.addEventListener('click', function () { location.reload(); });
+  }
+  if (autoRefreshToggleBtn) {
+    var autoRefreshKey = 'secscan-dashboard-auto-refresh';
+    var autoRefreshTimer = null;
+    function setAutoRefresh(enabled) {
+      if (autoRefreshTimer) { clearTimeout(autoRefreshTimer); autoRefreshTimer = null; }
+      autoRefreshToggleBtn.textContent = 'Auto Refresh: ' + (enabled ? 'On' : 'Off');
+      autoRefreshToggleBtn.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+      try { localStorage.setItem(autoRefreshKey, enabled ? 'on' : 'off'); } catch (_) {}
+      if (enabled) autoRefreshTimer = setTimeout(function () { location.reload(); }, 60000);
+    }
+    var enabled = false;
+    try { enabled = localStorage.getItem(autoRefreshKey) === 'on'; } catch (_) {}
+    setAutoRefresh(enabled);
+    autoRefreshToggleBtn.addEventListener('click', function () { setAutoRefresh(autoRefreshToggleBtn.getAttribute('aria-pressed') !== 'true'); });
+  }
 })();
 
-// Auto-refresh summary cards setiap 60 saat
-setTimeout(() => location.reload(), 60000);
+(function () {
+  var form = document.getElementById('geoIpUpdateForm');
+  var button = document.getElementById('geoIpUpdateBtn');
+  if (!form || !button) return;
+  form.addEventListener('submit', function () {
+    button.disabled = true;
+    button.textContent = 'Memuat turun & mengimport…';
+  });
+})();
+
+(function () {
+  var form = document.getElementById('domainGradeFilterForm');
+  var filter = document.getElementById('domainGradeFilter');
+  var sort = document.getElementById('domainSortFilter');
+  if (!form || !filter || !sort) return;
+  filter.addEventListener('change', function () { form.submit(); });
+  sort.addEventListener('change', function () { form.submit(); });
+})();
+
+// Country-level GeoIP visualisation. The database stays on this server; only
+// public vector-map assets are loaded by the administrator's browser.
+(function () {
+  var dataEl = document.getElementById('geoCountryData');
+  var target = document.getElementById('geoCountryMap');
+  var gradeFilter = document.getElementById('geoGradeFilter');
+  var metricFilter = document.getElementById('geoMetricFilter');
+  var list = document.getElementById('geoCountryList');
+  if (!dataEl || !target || !gradeFilter || !metricFilter || typeof jsVectorMap === 'undefined') return;
+  try {
+    try {
+      var savedGrade = localStorage.getItem('secscan-geo-grade');
+      var savedMetric = localStorage.getItem('secscan-geo-metric');
+      if (savedGrade && Array.from(gradeFilter.options).some(function (option) { return option.value === savedGrade; })) gradeFilter.value = savedGrade;
+      if (savedMetric && Array.from(metricFilter.options).some(function (option) { return option.value === savedMetric; })) metricFilter.value = savedMetric;
+    } catch (_) {}
+    var rows = JSON.parse(dataEl.textContent || '[]');
+    var displayNames = typeof Intl !== 'undefined' && Intl.DisplayNames
+      ? new Intl.DisplayNames(['ms'], { type: 'region' }) : null;
+    function nameFor(code) { return displayNames ? (displayNames.of(code) || code) : code; }
+    function escapeHtml(value) {
+      return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+    }
+    function aggregate() {
+      var grade = gradeFilter.value;
+      var grouped = {};
+      var totals = {};
+      rows.forEach(function (row) {
+        var code = String(row.country || '').toUpperCase();
+        var count = Number(row.cnt || 0);
+        var score = Number(row.avg_score || 0);
+        if (!/^[A-Z]{2}$/.test(code) || count < 1) return;
+        totals[code] = (totals[code] || 0) + count;
+        if (grade !== 'all' && String(row.grade || '') !== grade) return;
+        if (!grouped[code]) grouped[code] = { country: code, cnt: 0, scoreTotal: 0 };
+        grouped[code].cnt += count;
+        grouped[code].scoreTotal += score * count;
+      });
+      return Object.keys(grouped).map(function (code) {
+        var item = grouped[code];
+        item.avg = item.cnt ? item.scoreTotal / item.cnt : 0;
+        item.total = totals[code] || item.cnt;
+        return item;
+      });
+    }
+    function render() {
+      var metric = metricFilter.value;
+      var countries = aggregate();
+      var values = {};
+      countries.forEach(function (item) {
+        values[item.country] = metric === 'count' ? item.cnt : (metric === 'best' ? item.avg : 100 - item.avg);
+      });
+      var sort = metric === 'worst'
+        ? function (a, b) { return a.avg - b.avg; }
+        : metric === 'best'
+          ? function (a, b) { return b.avg - a.avg; }
+          : function (a, b) { return b.cnt - a.cnt; };
+      countries.sort(sort);
+      if (list) {
+        list.innerHTML = countries.slice(0, 10).map(function (item) {
+          var gradeText = gradeFilter.value === 'all'
+            ? 'Semua: ' + item.total + ' domain'
+            : gradeFilter.value + ': ' + item.cnt + ' / ' + item.total + ' domain';
+          return '<div class="geoip-country"><div><strong>' + escapeHtml(nameFor(item.country)) + '</strong><br><span>'
+            + escapeHtml(item.country) + ' · ' + gradeText + ' · skor ' + item.avg.toFixed(1) + '</span></div><strong>' + item.cnt + '</strong></div>';
+        }).join('') || '<div class="empty-state">Tiada rekod untuk penapis ini.</div>';
+      }
+      target.innerHTML = '';
+      var scale = metric === 'worst' ? ['#5a3038', '#fb7185'] : metric === 'best' ? ['#315c8a', '#7dd3fc'] : ['#2d7a75', '#59d8c3'];
+      new jsVectorMap({
+        selector: '#geoCountryMap', map: 'world', zoomButtons: false,
+        regionStyle: { initial: { fill: '#344657', fillOpacity: 1, stroke: '#607287', strokeWidth: 0.5 } },
+        series: { regions: [{ attribute: 'fill', scale: scale, values: values, normalizeFunction: 'polynomial' }] },
+        onRegionTooltipShow: function (event, tooltip, code) {
+          var item = countries.find(function (country) { return country.country === code; });
+          var label = gradeFilter.value === 'all' ? 'Semua' : gradeFilter.value;
+          tooltip.text(tooltip.text() + (item ? ' · ' + label + ': ' + item.cnt + ' / ' + item.total + ' domain · skor ' + item.avg.toFixed(1) : ' · tiada domain'));
+        }
+      });
+    }
+    gradeFilter.addEventListener('change', function () { try { localStorage.setItem('secscan-geo-grade', gradeFilter.value); } catch (_) {} render(); });
+    metricFilter.addEventListener('change', function () { try { localStorage.setItem('secscan-geo-metric', metricFilter.value); } catch (_) {} render(); });
+    render();
+  } catch (err) {
+    target.innerHTML = '<div class="empty-state">Peta tidak dapat dimuatkan. Jadual negara masih tersedia.</div>';
+  }
+})();
+
 </script>
 
 <?php endif; ?>

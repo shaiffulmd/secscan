@@ -59,6 +59,10 @@ class UrlGuard
             return self::error('Hanya URL http/https dibenarkan.', 400);
         }
 
+        if (isset($parsed['user']) || isset($parsed['pass'])) {
+            return self::error('URL tidak boleh mengandungi username atau password.', 400);
+        }
+
         $host = (string)$parsed['host'];
         if ($host === '' || strlen($host) > 253) {
             return self::error('Hostname tidak sah.', 400);

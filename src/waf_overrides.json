@@ -1,0 +1,12 @@
+{
+  "myfuturejobs.gov.my": {
+    "vendors": [
+      "F5 BIG-IP / F5 Advanced WAF (suspected)"
+    ],
+    "signals": [
+      "External response Set-Cookie header starts with BIGipServermyfuturejobs_pool",
+      "External response Set-Cookie header starts with TS015ed334 / TS0e1ad6a9027"
+    ],
+    "source": "Manual evidence captured from an external HTTPS HEAD request on 2026-07-07"
+  }
+}

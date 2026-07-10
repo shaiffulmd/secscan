@@ -31,6 +31,8 @@ $sendSecurityHeaders = static function (): void {
         "frame-src 'self' blob:",
         "worker-src 'none'",
         "manifest-src 'self'",
+        'report-to default',
+        'report-uri /reporting.php',
         'upgrade-insecure-requests',
     ]);
 
@@ -45,6 +47,7 @@ $sendSecurityHeaders = static function (): void {
     header('Cross-Origin-Opener-Policy: same-origin');
     header('Cross-Origin-Embedder-Policy: require-corp');
     header('Cross-Origin-Resource-Policy: same-origin');
+    secscan_send_operational_security_headers();
 
     $isHttps = secscan_is_https();
 
@@ -83,8 +86,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && strtolower($_SERVER['HTTP_X_REQUEST
 
     $enforceScanRateLimit = static function () use ($sendJson): void {
         $clientIp = secscan_client_ip();
+        if (secscan_is_owner_bypass_ip($clientIp)) {
+            header('X-RateLimit-Bypass: owner-ip');
+            header('X-RateLimit-Limit: bypass');
+            header('X-RateLimit-Remaining: bypass');
+            return;
+        }
+
         $rate = RateLimiter::consume(
-            'scan_v4',
+            'scan_v5',
             $clientIp,
             (int)secscan_config('scan_rate_limit'),
             (int)secscan_config('scan_rate_window')
@@ -94,19 +104,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && strtolower($_SERVER['HTTP_X_REQUEST
         header('X-RateLimit-Remaining: ' . $rate['remaining']);
         header('X-RateLimit-Reset: ' . $rate['reset']);
 
+        if (!empty($rate['storage_failed'])) {
+            $sendJson(['error' => 'Perkhidmatan rate limit tidak tersedia. Cuba semula kemudian.'], 503);
+        }
+
         if (!$rate['allowed']) {
             header('Retry-After: ' . $rate['retry_after']);
+            $limit = (int)secscan_config('scan_rate_limit');
+            $window = (int)secscan_config('scan_rate_window');
             $sendJson([
-                'error'       => 'Had scan telah dicapai. Maksimum 50 scan sahaja bagi setiap IP dalam 24 jam.',
-                'limit'       => $rate['limit'],
-                'window'      => (int)secscan_config('scan_rate_window'),
+                'error'       => "Had scan telah dicapai. Maksimum {$limit} scan sahaja bagi setiap IP dalam tempoh {$window} saat.",
+                'limit'       => $limit,
+                'window'      => $window,
                 'retry_after' => $rate['retry_after'],
                 'client_ip'   => $clientIp,
             ], 429);
         }
     };
 
-    $rawBody = file_get_contents('php://input') ?: '';
+    $rawBody = secscan_read_request_body();
+    if ($rawBody === null) {
+        $sendJson(['error' => 'Request terlalu besar.'], 413);
+    }
     $input   = json_decode($rawBody, true);
     $target  = UrlGuard::normalizeAndValidate((string)($input['url'] ?? $_POST['url'] ?? $_GET['url'] ?? ''));
     if (!$target['ok']) {
@@ -136,6 +155,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && strtolower($_SERVER['HTTP_X_REQUEST
             $authHeaders = $input['auth_headers'] ?? [];
             if (!is_array($authHeaders)) $authHeaders = [];
             if ($authCookie !== '' || $authHeaders !== []) {
+                if (($target['scheme'] ?? '') !== 'https') {
+                    $sendJson(['error' => 'Authenticated scan memerlukan URL HTTPS yang sah.'], 400);
+                }
                 $scanner->setAuth($authHeaders, $authCookie);
             }
         }
@@ -151,6 +173,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && strtolower($_SERVER['HTTP_X_REQUEST
         $result['request'] = [
             'client_ip' => $clientIp,
         ];
+        $result['scanner_identity'] = secscan_scanner_identity();
 
         // Log scan ke SQLite untuk dashboard
         try {
@@ -192,6 +215,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && strtolower($_SERVER['HTTP_X_REQUEST
 }
 
 $sendSecurityHeaders();
+$scannerIdentity = secscan_scanner_identity();
+$scannerAllowlistConfigured = !empty($scannerIdentity['configured']);
+$scannerAllowlistText = (string)($scannerIdentity['allowlist_text'] ?? '');
+$appVersion = secscan_app_version();
 ?>
 <!DOCTYPE html>
 <html lang="ms">
@@ -201,8 +228,8 @@ $sendSecurityHeaders();
   <meta name="theme-color" content="#F4F7FB" media="(prefers-color-scheme: light)"/>
   <meta name="theme-color" content="#080D14" media="(prefers-color-scheme: dark)"/>
   <title>SecScan — Platform Risikan Keselamatan</title>
-  <link rel="icon" type="image/svg+xml" href="secscan-logo.svg"/>
-  <link rel="shortcut icon" href="secscan-logo.svg"/>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg"/>
+  <link rel="shortcut icon" href="favicon.svg"/>
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=Lora:wght@500;600&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet"/>
@@ -224,6 +251,7 @@ $sendSecurityHeaders();
           </div>
         </a>
         <div class="header-actions">
+          <a class="dashboard-link" href="server-audit.php">Audit Server</a>
           <a class="dashboard-link" href="dashboard.php">Papan Pemuka</a>
           <div class="live-badge">
               <span class="live-dot" aria-hidden="true">&#8203;</span>
@@ -292,6 +320,28 @@ $sendSecurityHeaders();
             </button>
           </div>
           <div class="scan-status" id="termStatus"></div>
+
+<?php if ($scannerAllowlistConfigured): ?>
+          <div class="allowlist-panel">
+            <div class="allowlist-kicker">Allowlist sebelum scan</div>
+            <div class="allowlist-grid">
+              <div class="allowlist-item">
+                <span>Domain scanner</span>
+                <strong><?= htmlspecialchars((string)($scannerIdentity['domain'] ?? '') ?: 'Belum dikonfigurasi', ENT_QUOTES, 'UTF-8') ?></strong>
+              </div>
+              <div class="allowlist-item">
+                <span>IP server scanner</span>
+                <strong><?= htmlspecialchars(!empty($scannerIdentity['ips']) ? implode(', ', $scannerIdentity['ips']) : 'Belum dikonfigurasi', ENT_QUOTES, 'UTF-8') ?></strong>
+              </div>
+            </div>
+            <div class="allowlist-note">
+              Minta pemilik target allowlist nilai ini pada WAF/firewall sebelum scan jika target ada bot protection.
+              <?php if ($scannerAllowlistText !== ''): ?>
+                <button type="button" class="allowlist-copy" data-copy="<?= htmlspecialchars($scannerAllowlistText, ENT_QUOTES, 'UTF-8') ?>">Salin</button>
+              <?php endif; ?>
+            </div>
+          </div>
+<?php endif; ?>
 
 <?php if (secscan_config('allow_auth_scan')): ?>
           <!-- Scan berautentikasi (lanjutan) -->
@@ -487,78 +537,26 @@ $sendSecurityHeaders();
         </div>
 
       </section>
-      <!-- SERVER AUDIT DOWNLOAD -->
-<?php
-        $scheme = secscan_is_https() ? 'https' : 'http';
-        $host   = $_SERVER['HTTP_HOST'] ?? 'your-server.com';
-        $base   = $scheme . '://' . preg_replace('/[^A-Za-z0-9.\-:]/', '', $host);
-?>
-      <section class="server-audit">
-        <div class="sa-head">
+      <!-- SERVER AUDIT LINK -->
+      <section class="audit-teaser" aria-labelledby="auditTeaserTitle">
+        <div>
           <div class="sa-kicker">Alat tambahan</div>
-          <h2 class="sa-title">Audit keselamatan pelayan Ubuntu</h2>
-          <p class="sa-sub">Skrip bash <strong>read-only</strong> yang menyemak firewall, SSH, pengguna, kemas kini, port terbuka dan keizinan fail — kemudian menjana laporan HTML dengan cadangan pembetulan. Tiada perubahan dibuat pada sistem anda.</p>
+          <h2 id="auditTeaserTitle">Audit keselamatan pelayan Ubuntu</h2>
+          <p>Skrip audit read-only kini diletakkan pada halaman khusus supaya scanner utama kekal ringkas.</p>
         </div>
-
-        <div class="sa-card">
-          <div class="sa-step">
-            <span class="sa-num">1</span>
-            <span class="sa-step-label">Jalankan pada pelayan anda</span>
-            <span class="sa-badge">Disyorkan</span>
-          </div>
-          <div class="sa-terminal">
-            <div class="sa-terminal-bar">
-              <span class="sa-tdot" aria-hidden="true">&#8203;</span><span class="sa-tdot" aria-hidden="true">&#8203;</span><span class="sa-tdot" aria-hidden="true">&#8203;</span>
-              <span class="sa-terminal-title">bash</span>
-              <button type="button" class="sa-copy" id="saCopyBtn" aria-label="Salin arahan">
-                <svg class="sa-copy-ic" width="14" height="14" viewBox="0 0 24 24" fill="none">
-                  <rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" stroke-width="1.7"/>
-                  <path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
-                </svg>
-                <span class="sa-copy-txt">Salin</span>
-              </button>
-            </div>
-            <div class="sa-terminal-body">
-              <span class="sa-prompt">$</span>
-              <code id="saCurl">curl -fsSL <?= htmlspecialchars($base, ENT_QUOTES) ?>/audit.sh | sudo bash</code>
-            </div>
-          </div>
-          <p class="sa-tip">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-              <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.7"/>
-              <path d="M12 11v5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>
-              <circle cx="12" cy="7.6" r="1" fill="currentColor"/>
-            </svg>
-            <span>Amalan selamat: baca skrip dahulu sebelum jalankan sebagai root. Muat turun dengan <code>-o audit.sh</code>, semak kandungannya, kemudian <code>sudo bash audit.sh</code>.</span>
-          </p>
-
-          <div class="sa-divider"><span>atau</span></div>
-
-          <div class="sa-step">
-            <span class="sa-num">2</span>
-            <span class="sa-step-label">Muat turun dan semak dahulu</span>
-          </div>
-          <div class="sa-download-row">
-            <a class="sa-download" href="audit.sh" download>
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                <path d="M12 3v12m0 0 4-4m-4 4-4-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-                <path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-              </svg>
-              Muat turun audit.sh
-            </a>
-            <div class="sa-run">Kemudian jalankan <code>sudo bash audit.sh</code></div>
-          </div>
-        </div>
+        <a class="audit-teaser-link" href="server-audit.php">Buka audit server</a>
       </section>
 
     </main>
 
     <footer class="footer">
       <span>© 2026 SecScan Enterprise. Hak cipta terpelihara.</span>
+      <span class="footer-version">Versi <?= htmlspecialchars($appVersion, ENT_QUOTES, 'UTF-8') ?></span>
       <nav class="footer-links" aria-label="Pautan legal SecScan">
         <a href="#terma" data-legal-modal="terms">Terma</a>
         <a href="#privasi" data-legal-modal="privacy">Privasi</a>
         <a href="#penafian" data-legal-modal="disclaimer">Penafian</a>
+        <a href="server-audit.php">Audit Server</a>
         <a href="dashboard.php">Papan Pemuka</a>
       </nav>
     </footer>

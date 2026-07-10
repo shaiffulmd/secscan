@@ -20,7 +20,7 @@ DirectoryIndex index.php
     Require all denied
 </FilesMatch>
 
-<FilesMatch "^(config\.php|composer\.(json|lock)|package(-lock)?\.json|README\.md|AGENTS\.md)$">
+<FilesMatch "^(config\.php|composer\.(json|lock)|package(-lock)?\.json|README\.md|AGENTS\.md|VERSION)$">
     Require all denied
 </FilesMatch>
 

@@ -96,6 +96,29 @@ function secscan_env(string $key, ?string $default = null): ?string
     return $value;
 }
 
+/**
+ * Application version shown in the scanner footer and dashboard. Set
+ * SECSCAN_APP_VERSION to override a deployment, otherwise update the VERSION
+ * file as part of every release.
+ */
+function secscan_app_version(): string
+{
+    static $version = null;
+    if ($version !== null) {
+        return $version;
+    }
+
+    $candidate = trim((string)secscan_env('SECSCAN_APP_VERSION', ''));
+    if ($candidate === '') {
+        $raw = @file_get_contents(__DIR__ . '/VERSION');
+        $candidate = is_string($raw) ? trim($raw) : '';
+    }
+
+    return $version = preg_match('/^v?\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?$/', $candidate)
+        ? ltrim($candidate, 'v')
+        : 'dev';
+}
+
 function secscan_config(?string $key = null)
 {
     static $config = null;
@@ -110,6 +133,17 @@ function secscan_config(?string $key = null)
             'dashboard_password_hash' => secscan_env('SECSCAN_DASHBOARD_PASSWORD_HASH', ''),
             'scan_rate_limit' => (int)secscan_env('SECSCAN_SCAN_RATE_LIMIT', '50'),
             'scan_rate_window' => (int)secscan_env('SECSCAN_SCAN_RATE_WINDOW', '86400'),
+            'max_request_bytes' => max(1024, (int)secscan_env('SECSCAN_MAX_REQUEST_BYTES', '65536')),
+            'rate_limit_max_keys' => max(100, (int)secscan_env('SECSCAN_RATE_LIMIT_MAX_KEYS', '10000')),
+            'report_rate_limit' => max(1, (int)secscan_env('SECSCAN_REPORT_RATE_LIMIT', '30')),
+            'report_rate_window' => max(1, (int)secscan_env('SECSCAN_REPORT_RATE_WINDOW', '60')),
+            'report_log_max_bytes' => max(65536, (int)secscan_env('SECSCAN_REPORT_LOG_MAX_BYTES', '5242880')),
+            // Owner/admin IP allowlist that may scan without consuming the public
+            // per-IP scan quota. Comma-separated IPs or CIDR ranges.
+            'owner_bypass_ips' => secscan_env('SECSCAN_OWNER_BYPASS_IPS', ''),
+            // Successful dashboard logins can grant a temporary scan-quota bypass
+            // for the admin's current IP. Default follows the dashboard session.
+            'owner_bypass_ttl' => max(60, (int)secscan_env('SECSCAN_OWNER_BYPASS_TTL', '3600')),
             'api_rate_limit' => (int)secscan_env('SECSCAN_API_RATE_LIMIT', '5'),
             'api_rate_window' => (int)secscan_env('SECSCAN_API_RATE_WINDOW', '60'),
             'max_url_length' => (int)secscan_env('SECSCAN_MAX_URL_LENGTH', '2048'),
@@ -119,6 +153,10 @@ function secscan_config(?string $key = null)
             'trusted_proxies' => secscan_env('SECSCAN_TRUSTED_PROXIES', ''),
             // Set to "1" to additionally trust Cloudflare's published edge ranges.
             'trust_cloudflare' => secscan_env('SECSCAN_TRUST_CLOUDFLARE', '0'),
+            // Public scanner identity shown to users so target owners can
+            // allowlist this scanner in their WAF/firewall before scanning.
+            'scanner_public_domain' => secscan_env('SECSCAN_SCANNER_PUBLIC_DOMAIN', ''),
+            'scanner_public_ips' => secscan_env('SECSCAN_SCANNER_PUBLIC_IPS', ''),
             // Authenticated scanning: accept per-request session cookies / auth
             // headers so scans can run behind a login. OFF by default because a
             // public, unauthenticated API endpoint that forwards arbitrary
@@ -133,6 +171,53 @@ function secscan_config(?string $key = null)
     }
 
     return $config[$key] ?? null;
+}
+
+/** Read a request body without permitting an unbounded PHP allocation. */
+function secscan_read_request_body(?int $maxBytes = null): ?string
+{
+    $maxBytes = $maxBytes ?? (int)secscan_config('max_request_bytes');
+    $contentLength = $_SERVER['CONTENT_LENGTH'] ?? '';
+    if (is_string($contentLength) && ctype_digit($contentLength) && (int)$contentLength > $maxBytes) {
+        return null;
+    }
+
+    $body = file_get_contents('php://input', false, null, 0, $maxBytes + 1);
+    return is_string($body) && strlen($body) <= $maxBytes ? $body : null;
+}
+
+function secscan_scanner_identity(): array
+{
+    $configuredDomain = trim((string)secscan_config('scanner_public_domain'));
+    $configuredIps = trim((string)secscan_config('scanner_public_ips'));
+    $configured = $configuredDomain !== '' || $configuredIps !== '';
+
+    $domain = $configuredDomain;
+    if ($domain === '') {
+        $domain = trim((string)($_SERVER['HTTP_HOST'] ?? ''));
+        $domain = preg_replace('/:\d+$/', '', $domain) ?: '';
+    }
+
+    $ips = array_values(array_unique(array_filter(array_map(
+        static fn($ip): string => trim((string)$ip),
+        explode(',', (string)secscan_config('scanner_public_ips'))
+    ))));
+    if ($ips === []) {
+        $serverAddr = trim((string)($_SERVER['SERVER_ADDR'] ?? ''));
+        if (filter_var($serverAddr, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+            $ips[] = $serverAddr;
+        }
+    }
+
+    return [
+        'configured' => $configured,
+        'domain' => $domain,
+        'ips' => $ips,
+        'allowlist_text' => trim(implode(', ', array_filter([
+            $domain,
+            implode(', ', $ips),
+        ]))),
+    ];
 }
 
 /**
@@ -247,6 +332,146 @@ function secscan_ip_in_cidr(string $ip, string $range): bool
     return (ord($ipBin[$fullBytes]) & ord($mask)) === (ord($subnetBin[$fullBytes]) & ord($mask));
 }
 
+function secscan_ip_in_ranges(string $ip, string $ranges): bool
+{
+    if (!filter_var($ip, FILTER_VALIDATE_IP)) {
+        return false;
+    }
+
+    foreach (array_filter(array_map('trim', explode(',', $ranges))) as $range) {
+        if (secscan_ip_in_cidr($ip, $range)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function secscan_is_owner_bypass_ip(string $ip): bool
+{
+    if (secscan_ip_in_ranges($ip, (string)secscan_config('owner_bypass_ips'))) {
+        return true;
+    }
+
+    $entries = secscan_auto_owner_bypass_entries();
+    return isset($entries[$ip]) && (int)$entries[$ip] >= time();
+}
+
+function secscan_owner_bypass_file(): string
+{
+    $dataDir = (string)secscan_config('data_dir');
+    if ($dataDir === '') {
+        return '';
+    }
+    if (!is_dir($dataDir) && !@mkdir($dataDir, 0750, true) && !is_dir($dataDir)) {
+        return '';
+    }
+    if (!is_writable($dataDir)) {
+        return '';
+    }
+    return rtrim($dataDir, '/\\') . '/owner_bypass_ips.json';
+}
+
+function secscan_auto_owner_bypass_entries(): array
+{
+    $file = secscan_owner_bypass_file();
+    if ($file === '') {
+        return [];
+    }
+
+    $fp = @fopen($file, 'c+');
+    if (!$fp) {
+        return [];
+    }
+
+    flock($fp, LOCK_EX);
+    rewind($fp);
+    $raw = stream_get_contents($fp);
+    $entries = is_string($raw) && $raw !== '' ? (json_decode($raw, true) ?: []) : [];
+    $now = time();
+    $clean = [];
+    foreach ($entries as $ip => $expires) {
+        if (filter_var((string)$ip, FILTER_VALIDATE_IP) && (int)$expires >= $now) {
+            $clean[(string)$ip] = (int)$expires;
+        }
+    }
+    if ($clean !== $entries) {
+        ftruncate($fp, 0);
+        rewind($fp);
+        fwrite($fp, json_encode($clean, JSON_UNESCAPED_SLASHES));
+    }
+    flock($fp, LOCK_UN);
+    fclose($fp);
+
+    return $clean;
+}
+
+function secscan_remember_owner_bypass_ip(string $ip, ?int $ttl = null): bool
+{
+    if (!filter_var($ip, FILTER_VALIDATE_IP)) {
+        return false;
+    }
+    $file = secscan_owner_bypass_file();
+    if ($file === '') {
+        return false;
+    }
+
+    $ttl = $ttl ?? (int)secscan_config('owner_bypass_ttl');
+    $expires = time() + max(60, $ttl);
+
+    $fp = @fopen($file, 'c+');
+    if (!$fp) {
+        return false;
+    }
+
+    flock($fp, LOCK_EX);
+    rewind($fp);
+    $raw = stream_get_contents($fp);
+    $entries = is_string($raw) && $raw !== '' ? (json_decode($raw, true) ?: []) : [];
+    $now = time();
+    $clean = [];
+    foreach ($entries as $entryIp => $entryExpires) {
+        if (filter_var((string)$entryIp, FILTER_VALIDATE_IP) && (int)$entryExpires >= $now) {
+            $clean[(string)$entryIp] = (int)$entryExpires;
+        }
+    }
+    $clean[$ip] = $expires;
+    ftruncate($fp, 0);
+    rewind($fp);
+    fwrite($fp, json_encode($clean, JSON_UNESCAPED_SLASHES));
+    flock($fp, LOCK_UN);
+    fclose($fp);
+
+    return true;
+}
+
+function secscan_forget_owner_bypass_ip(string $ip): void
+{
+    if (!filter_var($ip, FILTER_VALIDATE_IP)) {
+        return;
+    }
+    $file = secscan_owner_bypass_file();
+    if ($file === '' || !is_file($file)) {
+        return;
+    }
+
+    $fp = @fopen($file, 'c+');
+    if (!$fp) {
+        return;
+    }
+
+    flock($fp, LOCK_EX);
+    rewind($fp);
+    $raw = stream_get_contents($fp);
+    $entries = is_string($raw) && $raw !== '' ? (json_decode($raw, true) ?: []) : [];
+    unset($entries[$ip]);
+    ftruncate($fp, 0);
+    rewind($fp);
+    fwrite($fp, json_encode($entries, JSON_UNESCAPED_SLASHES));
+    flock($fp, LOCK_UN);
+    fclose($fp);
+}
+
 /**
  * Cloudflare's published edge IP ranges. See https://www.cloudflare.com/ips/
  * Used only when SECSCAN_TRUST_CLOUDFLARE=1.
@@ -287,4 +512,54 @@ function secscan_is_https(): bool
         }
     }
     return false;
+}
+
+function secscan_request_origin(): string
+{
+    $scheme = secscan_is_https() ? 'https' : 'http';
+    $host = trim((string)($_SERVER['HTTP_HOST'] ?? 'security.apasaja.my'));
+    $host = preg_replace('/[\r\n].*$/', '', $host) ?: 'security.apasaja.my';
+    $host = preg_replace('/[^A-Za-z0-9.\-:\[\]]/', '', $host) ?: 'security.apasaja.my';
+
+    return $scheme . '://' . $host;
+}
+
+function secscan_reporting_endpoint(): string
+{
+    $configured = trim((string)secscan_env('SECSCAN_REPORTING_ENDPOINT', ''));
+    if ($configured !== '') {
+        if (preg_match('#^https?://#i', $configured)) {
+            return $configured;
+        }
+        if ($configured[0] === '/') {
+            return secscan_request_origin() . $configured;
+        }
+    }
+
+    return secscan_request_origin() . '/reporting.php';
+}
+
+function secscan_send_operational_security_headers(): void
+{
+    if (headers_sent()) {
+        return;
+    }
+
+    $endpoint = secscan_reporting_endpoint();
+
+    header('Origin-Agent-Cluster: ?1');
+    header('Reporting-Endpoints: default=' . json_encode($endpoint, JSON_UNESCAPED_SLASHES));
+    header('Report-To: ' . json_encode([
+        'group' => 'default',
+        'max_age' => 86400,
+        'endpoints' => [
+            ['url' => $endpoint],
+        ],
+        'include_subdomains' => true,
+    ], JSON_UNESCAPED_SLASHES));
+    header('NEL: ' . json_encode([
+        'report_to' => 'default',
+        'max_age' => 86400,
+        'include_subdomains' => true,
+    ], JSON_UNESCAPED_SLASHES));
 }

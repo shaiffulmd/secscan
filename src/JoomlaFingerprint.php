@@ -92,10 +92,9 @@ final class JoomlaFingerprint
         $seen = [];
 
         foreach (self::passiveRules() as $rule) {
-            $needle = strtolower($rule['needle']);
             $match = !empty($rule['regex'])
                 ? (bool)preg_match($rule['needle'], $html)
-                : str_contains($hay, $needle);
+                : str_contains($hay, strtolower($rule['needle']));
             if ($match && !isset($seen[$rule['label']])) {
                 $seen[$rule['label']] = true;
                 $signals[] = ['label' => $rule['label'], 'weight' => $rule['weight']];

@@ -60,6 +60,7 @@ foreach ($required as $ext) {
 foreach ($optional as $ext) {
     res(extension_loaded($ext) ? 'PASS' : 'WARN', "ext-{$ext} (pilihan)", extension_loaded($ext) ? '' : 'disyorkan');
 }
+res(function_exists('gzopen') ? 'PASS' : 'WARN', 'zlib/gzip (GeoIP update)', function_exists('gzopen') ? '' : 'diperlukan untuk butang kemas kini GeoIP');
 
 // ---- 3. Fail wajib ------------------------------------------------
 echo $nl . "3. Fail & folder wajib" . $nl;

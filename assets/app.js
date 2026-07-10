@@ -80,7 +80,7 @@
         body: `
           <p>SecScan menyimpan maklumat minimum yang diperlukan untuk operasi keselamatan dan audit dalaman.</p>
           <ul>
-            <li>Data scan seperti URL, keputusan keselamatan, status WAF, CMS, dan IP pengimbas boleh disimpan dalam rekod sistem.</li>
+            <li>Data scan seperti URL, keputusan keselamatan, status WAF, CMS, IP pengimbas, dan negara anggaran daripada IP boleh disimpan dalam rekod sistem.</li>
             <li>Kuki persetujuan digunakan untuk mengingati penerimaan terma selama 30 hari pada pelayar ini.</li>
             <li>Maklumat tidak bertujuan dijual atau dikongsi di luar organisasi tanpa asas operasi yang sah.</li>
           </ul>
@@ -227,6 +227,11 @@
         if (e.target === legalModal) hideLegalModal();
       });
     }
+    document.addEventListener('click', e => {
+      const btn = e.target.closest('[data-copy]');
+      if (!btn) return;
+      copyToClipboard(btn.getAttribute('data-copy') || '');
+    });
 
     // Delegated toggle for the collapsible ecosystem-CVE block. Findings are
     // re-rendered on each scan, so a single listener on the container is enough.
@@ -510,15 +515,28 @@
       const cms = data.detected_cms
         ? data.detected_cms + (data.detected_cms_version ? ' ' + data.detected_cms_version : '')
         : (data.scan_blocked ? 'Disekat captcha / validation' : 'Tidak dikesan');
-      const scannerIp = data.scan_client_ip || 'Tidak dikesan';
+      const wafLabel = data.waf && data.waf.detected
+        ? data.waf.vendors.slice(0, 2).join(', ')
+        : 'Tidak dikesan';
+      const userIp = data.scan_client_ip || 'Tidak dikesan';
+      const scannerIdentity = data.scanner_identity || {};
+      const scannerConfigured = Boolean(scannerIdentity.configured);
+      const scannerDomain = scannerIdentity.domain || 'Tidak dikonfigurasi';
+      const scannerPublicIp = Array.isArray(scannerIdentity.ips) && scannerIdentity.ips.length
+        ? scannerIdentity.ips.join(', ')
+        : 'Tidak dikonfigurasi';
       const items = [
         ['Protokol', (target.scheme || '').toUpperCase() || detectScheme(data.url)],
         ['CMS', cms],
+        ['WAF', wafLabel],
         ['Masa scan', data.scan_time || '—'],
-        ['IP pengguna scan', scannerIp],
+        ['IP pengguna', userIp],
         ['IPv4', ipv4],
         ['IPv6', ipv6],
       ];
+      if (scannerConfigured) {
+        items.splice(5, 0, ['Domain scanner', scannerDomain], ['IP server scanner', scannerPublicIp]);
+      }
       targetMetaGrid.innerHTML = items.map(([label,value]) => `
         <div class="target-chip">
           <div class="target-chip-label">${escHtml(label)}</div>
@@ -572,13 +590,18 @@
       setGradeScale(score, tone);
 
       // WAF / captcha badge + active probe row.
+      const wafDetected = data.waf && data.waf.detected;
+      const wafVendors = wafDetected ? data.waf.vendors.join(', ') : '';
       if (data.scan_blocked) {
         const blockType = data.scan_blocked_type || 'Captcha / WAF';
         if (intelWaf) { intelWaf.textContent = 'WAF dikesan'; intelWaf.className = 'intel-badge warn'; }
-        if (intelProbe) intelProbe.textContent = blockType.charAt(0).toUpperCase() + blockType.slice(1) + ' disekat';
+        if (intelProbe) intelProbe.textContent = wafVendors || (blockType.charAt(0).toUpperCase() + blockType.slice(1) + ' disekat');
+      } else if (wafDetected) {
+        if (intelWaf) { intelWaf.textContent = 'WAF dikesan'; intelWaf.className = 'intel-badge warn'; }
+        if (intelProbe) intelProbe.textContent = wafVendors;
       } else {
-        if (intelWaf) { intelWaf.textContent = 'Tiada sekatan dikesan'; intelWaf.className = 'intel-badge'; }
-        if (intelProbe) intelProbe.textContent = 'Lulus';
+        if (intelWaf) { intelWaf.textContent = 'Tiada WAF dikesan'; intelWaf.className = 'intel-badge'; }
+        if (intelProbe) intelProbe.textContent = 'Tiada fingerprint';
       }
 
       // CMS fingerprint.
@@ -592,8 +615,16 @@
     function renderScanBlockedPanel(data) {
       if (!data.scan_blocked) return '';
       const detail = data.scan_blocked_detail || {};
-      const title = detail.title || 'Scan disekat oleh captcha / validation page';
+      const wafVendors = data.waf && data.waf.detected && Array.isArray(data.waf.vendors)
+        ? data.waf.vendors.filter(Boolean)
+        : [];
+      const title = wafVendors.length
+        ? `Scan disekat oleh ${wafVendors.slice(0, 2).join(', ')}`
+        : (detail.title || 'Scan disekat oleh captcha / validation page');
       const message = detail.message || 'Server tidak memulangkan HTML sebenar laman web kepada scanner.';
+      const signalText = wafVendors.length
+        ? `Fingerprint WAF: ${wafVendors.join(', ')}.`
+        : '';
       const actions = Array.isArray(detail.actions) && detail.actions.length
         ? detail.actions
         : [
@@ -613,6 +644,7 @@
             <div class="blocked-kicker">Perlu tindakan sebelum scan lengkap</div>
             <div class="blocked-title">${escHtml(title)}</div>
             <div class="blocked-msg">${escHtml(message)}</div>
+            ${signalText ? `<div class="blocked-msg">${escHtml(signalText)}</div>` : ''}
             <div class="blocked-steps">
               ${actions.map((action, i) => `
                 <div class="blocked-step">
@@ -895,6 +927,7 @@
       });
 
       const cmsInfo = normalizeDetectedCms(data, findings);
+      const wafInfo = normalizeWafInfo(data, findings);
       const target = data.target || {};
       const serverIp = data.server_ip || {};
       target.ipv4 = Array.isArray(target.ipv4) ? target.ipv4 : (Array.isArray(serverIp.ipv4) ? serverIp.ipv4 : []);
@@ -921,11 +954,50 @@
         scan_blocked: Boolean(data.scan_blocked),
         scan_blocked_type: String(data.scan_blocked_type || ''),
         scan_blocked_detail: (data.scan_blocked_detail && typeof data.scan_blocked_detail === 'object') ? data.scan_blocked_detail : {},
+        scanner_identity: normalizeScannerIdentity(data.scanner_identity),
+        waf: wafInfo,
         categories: normalizedCategories,
         category_scores: (data.category_scores && typeof data.category_scores === 'object') ? data.category_scores : {},
         recommendations: Array.isArray(data.recommendations) ? data.recommendations : [],
         findings,
         target
+      };
+    }
+
+    function normalizeWafInfo(data, findings) {
+      const raw = (data.waf && typeof data.waf === 'object') ? data.waf : {};
+      const vendors = Array.isArray(raw.vendors)
+        ? raw.vendors.map(v => String(v || '').trim()).filter(Boolean)
+        : [];
+      if (vendors.length) {
+        return {
+          detected: raw.detected !== false,
+          vendors,
+          signals: (raw.signals && typeof raw.signals === 'object') ? raw.signals : {}
+        };
+      }
+
+      const wafFinding = (findings || []).find(f =>
+        f.category === 'Technology'
+        && String(f.check || '') === 'WAF / Edge Protection'
+        && /detected:/i.test(String(f.message || ''))
+      );
+      if (!wafFinding) return { detected: false, vendors: [], signals: {} };
+
+      const match = String(wafFinding.message || '').match(/detected:\s*([^.]*)\./i);
+      const parsed = match
+        ? match[1].split(',').map(v => v.trim()).filter(Boolean)
+        : [];
+      return { detected: parsed.length > 0, vendors: parsed, signals: {} };
+    }
+
+    function normalizeScannerIdentity(identity) {
+      const raw = (identity && typeof identity === 'object') ? identity : {};
+      return {
+        configured: Boolean(raw.configured),
+        domain: String(raw.domain || '').trim(),
+        ips: Array.isArray(raw.ips) ? raw.ips.map(ip => String(ip || '').trim()).filter(Boolean) : [],
+        allowlist_text: String(raw.allowlist_text || '').trim()
       };
     }
 
@@ -1050,7 +1122,15 @@
 
       const ip4 = (data.target?.ipv4 || []).join(', ') || '-';
       const ip6 = (data.target?.ipv6 || []).join(', ') || '-';
-      const scannerIp = data.scan_client_ip || '-';
+      const userIp = data.scan_client_ip || '-';
+      const scannerIdentity = data.scanner_identity || {};
+      const scannerConfigured = Boolean(scannerIdentity.configured);
+      const scannerDomain = scannerIdentity.domain || '-';
+      const scannerIps = Array.isArray(scannerIdentity.ips) && scannerIdentity.ips.length ? scannerIdentity.ips.join(', ') : '-';
+      const scannerReportRows = scannerConfigured
+        ? `Domain scanner: ${escHtml(scannerDomain)}<br>
+      IP server scanner: ${escHtml(scannerIps)}<br>`
+        : '';
 
       return `<!doctype html>
 <html lang="ms">
@@ -1088,7 +1168,8 @@
     <div class="small">
       Scan: ${escHtml(data.scan_time || '-')}<br>
       Tempoh: ${escHtml(data.duration || '-')}<br>
-      IP pengimbas: ${escHtml(scannerIp)}<br>
+      IP pengguna: ${escHtml(userIp)}<br>
+      ${scannerReportRows}
       IPv4: ${escHtml(ip4)}<br>
       IPv6: ${escHtml(ip6)}
     </div>
