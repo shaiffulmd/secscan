@@ -46,11 +46,44 @@ class RateLimiter
             error_log('[SecScan] Rate limit file could not be opened: ' . $file);
             return self::failure($limit, $window, $now);
         }
+        @chmod($file, 0600);
 
-        flock($fp, LOCK_EX);
-        rewind($fp);
+        if (!flock($fp, LOCK_EX)) {
+            fclose($fp);
+            error_log('[SecScan] Rate limit file could not be locked: ' . $file);
+            return self::failure($limit, $window, $now);
+        }
+
+        if (!rewind($fp)) {
+            self::closeLockedFile($fp);
+            error_log('[SecScan] Rate limit file could not be read: ' . $file);
+            return self::failure($limit, $window, $now);
+        }
         $content = stream_get_contents($fp);
-        $rates = $content ? (json_decode($content, true) ?: []) : [];
+        if ($content === false) {
+            self::closeLockedFile($fp);
+            error_log('[SecScan] Rate limit file could not be read: ' . $file);
+            return self::failure($limit, $window, $now);
+        }
+
+        $rates = [];
+        if ($content !== '') {
+            $decoded = json_decode($content, true);
+            if (!is_array($decoded) || json_last_error() !== JSON_ERROR_NONE) {
+                // A corrupt state file must not permanently brick rate limiting:
+                // previously this failed closed on every request until an
+                // operator deleted the file. Preserve the bad content for
+                // forensics, then reset the bucket in place and continue.
+                // Deleting the file already resets it (fopen 'c+' recreates),
+                // so self-healing grants no capability an attacker with write
+                // access to the private data dir did not already have.
+                @file_put_contents($file . '.corrupt', $content, LOCK_EX);
+                error_log('[SecScan] Rate limit file contained invalid JSON; resetting bucket: ' . $file);
+                $rates = [];
+            } else {
+                $rates = $decoded;
+            }
+        }
 
         foreach ($rates as $rateKey => $timestamps) {
             if (!is_array($timestamps)) {
@@ -72,11 +105,10 @@ class RateLimiter
         if (!isset($rates[$key]) && count($rates) >= max(100, $maxKeys)) {
             // Persist expired-key cleanup before failing. Otherwise a full file
             // could remain permanently full after its entries have expired.
-            ftruncate($fp, 0);
-            rewind($fp);
-            fwrite($fp, json_encode($rates, JSON_UNESCAPED_SLASHES));
-            flock($fp, LOCK_UN);
-            fclose($fp);
+            if (!self::persist($fp, $rates)) {
+                error_log('[SecScan] Rate-limit cleanup could not be persisted: ' . $file);
+            }
+            self::closeLockedFile($fp);
             error_log('[SecScan] Rate-limit key capacity reached.');
             return self::failure($limit, $window, $now);
         }
@@ -88,14 +120,15 @@ class RateLimiter
 
         if ($allowed) {
             $rates[$key][] = $now;
-            ftruncate($fp, 0);
-            rewind($fp);
-            fwrite($fp, json_encode($rates, JSON_UNESCAPED_SLASHES));
+            if (!self::persist($fp, $rates)) {
+                self::closeLockedFile($fp);
+                error_log('[SecScan] Rate-limit state could not be persisted: ' . $file);
+                return self::failure($limit, $window, $now);
+            }
             $currentHits++;
         }
 
-        flock($fp, LOCK_UN);
-        fclose($fp);
+        self::closeLockedFile($fp);
 
         return [
             'allowed' => $allowed,
@@ -117,5 +150,24 @@ class RateLimiter
             'reset' => $now + max(1, $window),
             'storage_failed' => true,
         ];
+    }
+
+    /** @param resource $fp */
+    private static function persist($fp, array $rates): bool
+    {
+        $payload = json_encode($rates, JSON_UNESCAPED_SLASHES);
+        if (!is_string($payload) || !ftruncate($fp, 0) || !rewind($fp)) {
+            return false;
+        }
+
+        $written = fwrite($fp, $payload);
+        return $written === strlen($payload) && fflush($fp);
+    }
+
+    /** @param resource $fp */
+    private static function closeLockedFile($fp): void
+    {
+        flock($fp, LOCK_UN);
+        fclose($fp);
     }
 }

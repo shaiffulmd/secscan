@@ -33,6 +33,10 @@ Set these environment variables before deployment:
 Request JSON dihadkan melalui `SECSCAN_MAX_REQUEST_BYTES` (lalai 64 KiB). UI
 dan `api.php` berkongsi kuota scan yang sama (`SECSCAN_SCAN_RATE_LIMIT` /
 `SECSCAN_SCAN_RATE_WINDOW`), jadi kuota tidak boleh dipintas dengan menukar endpoint.
+Body target yang tidak dipercayai turut dibuffer secara terhad melalui
+`SECSCAN_TARGET_MAX_RESPONSE_BYTES` (lalai 2 MiB) dan
+`SECSCAN_PROBE_MAX_RESPONSE_BYTES` (lalai 256 KiB) untuk mengelakkan penggunaan
+memori tanpa had semasa scan.
 
 ## GeoIP country map
 
@@ -74,6 +78,38 @@ php -r "echo password_hash('YourNewPassword', PASSWORD_BCRYPT), PHP_EOL;"
 
 Store `SECSCAN_DATA_DIR` outside the public web root when possible. Apache deny rules are included as a fallback, but web-server config is safer than relying only on `.htaccess`.
 
+### Contact Us
+
+`about.php` includes a Contact Us form. Set `SECSCAN_CONTACT_ENCRYPTION_KEY` to a
+base64-encoded 32-byte value before enabling it; messages are stored with
+AES-256-GCM encryption and are readable only from the authenticated dashboard.
+Optionally set both `SECSCAN_CONTACT_MAIL_TO` and `SECSCAN_CONTACT_MAIL_FROM` to
+send a minimal PHP `mail()` notification after a message is saved. The message
+content remains in the dashboard rather than being included in the e-mail.
+
+## Worker VPS (optional)
+
+SecScan can keep the UI and audit database on security.apasaja.my while a VPS
+executes outbound scans. Deploy the same project code to the VPS, expose only
+worker.php over HTTPS, and configure the same SECSCAN_WORKER_SHARED_SECRET on
+both servers. On the web application, set:
+
+    SECSCAN_SCANNER_MODE=remote
+    SECSCAN_WORKER_URL=https://scanner-vps.example/worker.php
+    SECSCAN_WORKER_SHARED_SECRET=<random secret, at least 32 characters>
+
+On the VPS, keep SECSCAN_SCANNER_MODE=local, set the same shared secret, and
+optionally set SECSCAN_WORKER_ALLOWED_CALLERS to the public IP/CIDR of the web
+application. The worker accepts only signed POST jobs with a five-minute
+timestamp and one-time nonce; it never accepts browser requests directly.
+Keep the worker behind a firewall/VPN where possible and do not enable
+authenticated scans unless both servers are access-controlled.
+
+## Auto-deploy
+
+Pushing to `main` runs the tests and then updates the VPS through GitHub Actions.
+See [docs/auto-deploy.md](docs/auto-deploy.md) for the one-time setup.
+
 ## Safety Notes
 
 SecScan performs outbound HTTP, TLS, DNS, and limited port checks. Keep rate limits enabled, avoid exposing the API without access controls on high-traffic deployments, and only scan systems you are allowed to assess.
@@ -92,10 +128,60 @@ port checks, SecScan now flags:
 - **Email-auth hardening depth** — beyond SPF/DMARC presence: SPF DNS-lookup-limit
   and deprecated-`ptr` warnings, duplicate-SPF permerrors, DMARC enforcement
   coverage (`pct`/`sp`/`rua`), and SMTP TLS reporting (TLS-RPT).
+- **Detailed production errors** — detects PHP, database, Python, ASP.NET, and
+  Java stack/error disclosures without copying internal paths into the report.
+- **Cookie prefix and partitioning rules** — validates exact `Secure`, `HttpOnly`,
+  `SameSite`, `__Host-`, `__Secure-`, and `Partitioned` requirements while avoiding
+  false positives on non-session cookies that legitimately need JavaScript access.
+- **Deployment artefacts** — validates exposed VCS metadata, environment/config
+  backups, package lockfiles, registry credentials, Kubernetes config, and
+  ASP.NET connection settings using positive content signatures and soft-404 baselines.
+
+- **Version-matched advisories** — WordPress (wp2shell, CVE-2026-87902, 7.1.4),
+  Joomla (September 2026 release) and Drupal (SA-CORE-2026-004, -005, -014) core
+  ranges, PHP2Shell (CVE-2026-109618/109619) and current nginx/Apache fixes. A
+  short version such as the Drupal generator's `11` cannot prove a patch level,
+  so it is reported as unconfirmed rather than vulnerable. Distro-tagged banners
+  are downgraded because packages may carry backported fixes.
+- **CISA KEV awareness** — NVD CVEs are read newest-first and tagged when listed
+  in KEV. Recently exploited products (Ivanti, NetScaler, Cisco ASA, PAN-OS,
+  GitLab, Atlassian, ScreenConnect, Magento) are fingerprinted passively from the
+  landing page as non-scoring prompts, because the version is usually not visible.
+
+The advisory tables live in `scanner.php` (`CMS_CORE_ADVISORIES`,
+`KEV_PRODUCT_SIGNATURES`) and need periodic review; each notes its last review date.
 
 Accuracy/scoring improvements: CSP no longer flags `'unsafe-inline'` when a
 nonce/hash or `'strict-dynamic'` neutralises it, and advisory `info` findings are
 weighted so they no longer unfairly cap an otherwise well-configured site's grade.
+
+### Extended non-destructive detection
+
+A further set of checks sends a small number of crafted but **harmless** requests
+(unique markers, quote characters, traversal paths) to catch issues that passive
+fingerprinting cannot see. They never exploit a finding, write data, upload
+files, or brute-force credentials, and they run in parallel batches under a
+per-scan request budget:
+
+- **Active Probes** — open redirect, CRLF/response-header injection, Host-header
+  injection, unescaped input reflection (XSS markers), error-based SQL injection
+  and path traversal.
+- **Sensitive data** — JavaScript source-map exposure, public cloud-storage
+  bucket listing (S3/GCS/Azure/R2) and an expanded leaked-secret pattern set
+  (OpenAI, Anthropic, Discord, Telegram, DigitalOcean, Datadog, New Relic,
+  Shopify, Square, Mailchimp, Azure Storage, Sentry).
+- **Deeper CMS coverage** — Drupal/Magento/Ghost/TYPO3 version endpoints plus
+  WordPress theme versions, feeding the CVE matcher.
+- **API security** — public OpenAPI/Swagger schema exposure and structural JWT
+  weaknesses (`alg=none`, missing `exp`, `jku`/`jwk`).
+- **DNS/email depth** — MTA-STS policy fetch and validation (mode/mx/max_age).
+- **Infra/misconfiguration** — HTTP/2 cleartext (h2c), legacy
+  `X-Permitted-Cross-Domain-Policies`, request-smuggling framing indicators and
+  framework debug/profiler exposure.
+
+Toggle the whole extended set with `SECSCAN_ALLOW_ACTIVE_PROBES` (default `1`)
+and cap its request volume with `SECSCAN_ACTIVE_PROBE_MAX_REQUESTS`. Only enable
+active probing on targets you are authorised to test.
 
 ## Authenticated scanning
 
@@ -150,4 +236,30 @@ Or, if Composer is available:
 ```sh
 composer check
 composer test:detection
+composer test:rate-limit
+composer test:storage
+```
+
+Run the read-only codebase/deployment audit. It checks PHP syntax, dangerous
+source patterns, configuration hygiene, storage permissions, exposed archives,
+web-server rules and core verification scripts. It never deletes or rewrites
+files, and it does not print secret values:
+
+```sh
+php scripts/security_scan.php
+php scripts/security_scan.php --json > security-scan.json
+php scripts/test_codebase_scanner.php
+```
+
+The audit returns exit code `2` for critical findings and `1` for warnings. Use
+`--strict` in CI when warnings should fail the build. Findings are review
+signals, not proof of exploitability; verify the reported file and apply the
+recommendation before deployment.
+
+Run the storage regression test to verify fail-closed rate limiting, private
+runtime file modes, and owner-bypass persistence:
+
+```sh
+php scripts/test_rate_limiter.php
+php scripts/test_storage.php
 ```

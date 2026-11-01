@@ -5,6 +5,11 @@ if (PHP_SAPI !== 'cli') {
     exit('This script is CLI-only.');
 }
 
+if (!function_exists('exec')) {
+    fwrite(STDERR, "PHP exec() is unavailable; use scripts/security_scan.php for an in-process syntax audit.\n");
+    exit(2);
+}
+
 $root = dirname(__DIR__);
 $rii = new RecursiveIteratorIterator(
     new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS)

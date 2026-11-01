@@ -472,9 +472,10 @@
         label: 'Gred keselamatan',
         score: data.score,
         grade: data.grade,
+        assessed: data.assessment_status !== 'unavailable',
         counts: { critical: data.critical, warning: data.warnings, info: data.info, pass: data.passed },
         total: data.total_checks,
-        scoreLabel: `Skor: ${data.score}/100`,
+        scoreLabel: data.score === null ? 'Tidak dinilai' : `Skor: ${data.score}/100`,
         barLabel: 'Skor'
       });
 
@@ -482,16 +483,17 @@
         label: 'PCI DSS LITE',
         score: pci.score,
         grade: pci.grade,
+        assessed: pci.score !== null,
         counts: pci.counts,
         total: pci.total,
-        scoreLabel: `Skor: ${pci.score}/100`,
+        scoreLabel: pci.score === null ? 'Tidak dinilai' : `Skor: ${pci.score}/100`,
         barLabel: 'Pematuhan'
       });
 
       animateAssessment(securityOverview, data.score);
       animateAssessment(pciOverview, pci.score);
 
-      recommendationsCont.innerHTML = renderScanBlockedPanel(data) + renderEbookPanel(data) + renderRecommendations(data.recommendations);
+      recommendationsCont.innerHTML = renderAssessmentStatusPanel(data) + renderEbookPanel(data) + renderRecommendations(data.recommendations);
       categoryScoresCont.innerHTML = renderCategoryScores(data.category_scores);
       categoryScoresCont.querySelectorAll('.catscore-fill').forEach(el => {
         const sc = Number(el.getAttribute('data-score')) || 0;
@@ -576,6 +578,13 @@
 
     function renderIntelCard(data) {
       if (!intelGradeCard) return;
+      if (data.assessment_status === 'unavailable') {
+        intelGradeCard.className = 'security-grade-card tone-idle';
+        if (intelGrade) intelGrade.textContent = 'N/A';
+        if (intelGradeTitle) intelGradeTitle.textContent = 'Gred Keselamatan: Tidak dinilai';
+        if (intelGradeDesc) intelGradeDesc.textContent = data.assessment_reason || 'Scan tidak lengkap; gred keselamatan tidak dikira.';
+        setGradeScale(0, 'idle');
+      } else {
       const score = Math.max(0, Math.min(100, Number(data.score || 0)));
       const grade = data.grade || gradeFromScore(score);
       const tone = gradeTone(score);
@@ -588,6 +597,7 @@
           `${data.critical} kritikal · ${data.warnings} amaran · skor ${score}/100 daripada ${data.total_checks} semakan.`;
       }
       setGradeScale(score, tone);
+      }
 
       // WAF / captcha badge + active probe row.
       const wafDetected = data.waf && data.waf.detected;
@@ -612,26 +622,32 @@
       if (intelIp) intelIp.textContent = data.scan_client_ip || 'Tidak dikesan';
     }
 
-    function renderScanBlockedPanel(data) {
-      if (!data.scan_blocked) return '';
+    function renderAssessmentStatusPanel(data) {
+      if (!data.scan_blocked && data.assessment_status !== 'unavailable' && data.assessment_status !== 'partial') return '';
       const detail = data.scan_blocked_detail || {};
       const wafVendors = data.waf && data.waf.detected && Array.isArray(data.waf.vendors)
         ? data.waf.vendors.filter(Boolean)
         : [];
       const title = wafVendors.length
         ? `Scan disekat oleh ${wafVendors.slice(0, 2).join(', ')}`
-        : (detail.title || 'Scan disekat oleh captcha / validation page');
-      const message = detail.message || 'Server tidak memulangkan HTML sebenar laman web kepada scanner.';
+        : (detail.title || (data.assessment_status === 'partial' ? 'Scan separa sahaja' : 'Gred keselamatan tidak dapat dinilai'));
+      const message = detail.message || data.assessment_reason || 'Server tidak memulangkan kandungan laman sebenar kepada scanner.';
       const signalText = wafVendors.length
         ? `Fingerprint WAF: ${wafVendors.join(', ')}.`
         : '';
       const actions = Array.isArray(detail.actions) && detail.actions.length
         ? detail.actions
-        : [
-            'Allowlist IP/server scanner di WAF atau bot protection.',
-            'Jalankan authenticated scan dengan cookie/session yang sudah melepasi captcha.',
-            'Cuba semula selepas validation page dimatikan untuk endpoint scanner.'
-          ];
+        : (data.assessment_status === 'partial'
+          ? [
+              'Pulihkan capaian HTTPS dari rangkaian scanner.',
+              'Semak firewall, DNS, TLS certificate chain dan port 443.',
+              'Scan semula untuk mendapatkan semakan TLS dan gred penuh.'
+            ]
+          : [
+              'Semak sebab kegagalan sambungan yang dipaparkan di atas.',
+              'Pastikan URL awam boleh dicapai dari server scanner dan tidak disekat firewall/WAF.',
+              'Scan semula selepas capaian dipulihkan; gred hanya dikira apabila semakan sebenar lengkap.'
+            ]);
       return `
         <div class="blocked-panel">
           <div class="blocked-icon" aria-hidden="true">
@@ -641,7 +657,7 @@
             </svg>
           </div>
           <div class="blocked-main">
-            <div class="blocked-kicker">Perlu tindakan sebelum scan lengkap</div>
+            <div class="blocked-kicker">${data.assessment_status === 'partial' ? 'Keputusan scan terhad' : 'Perlu tindakan sebelum scan lengkap'}</div>
             <div class="blocked-title">${escHtml(title)}</div>
             <div class="blocked-msg">${escHtml(message)}</div>
             ${signalText ? `<div class="blocked-msg">${escHtml(signalText)}</div>` : ''}
@@ -675,17 +691,18 @@
           </div>`;
       }).join('');
 
-      const safeScore = Math.max(0, Math.min(100, Number(model.score || 0)));
+      const assessed = model.assessed !== false && model.score !== null;
+      const safeScore = assessed ? Math.max(0, Math.min(100, Number(model.score || 0))) : 0;
       return `
-        <div class="grade-card" data-score="${safeScore}">
+        <div class="grade-card${assessed ? '' : ' grade-unavailable'}" data-score="${safeScore}">
           <div class="grade-card-title">${escHtml(model.label || 'Gred')}</div>
           <div class="score-ring">
             <div class="score-ring-inner">
-              <div class="score-grade">${escHtml(model.grade || 'F')}</div>
-              <div class="score-ring-sub">Gred</div>
+              <div class="score-grade">${escHtml(assessed ? (model.grade || 'F') : 'N/A')}</div>
+              <div class="score-ring-sub">${assessed ? 'Gred' : 'Tidak dinilai'}</div>
             </div>
           </div>
-          <div class="score-pill">${safeScore}%</div>
+          <div class="score-pill">${assessed ? safeScore + '%' : 'Scan tidak lengkap'}</div>
           <div class="grade-stats">
             <div class="grade-stats-row">
               <div class="grade-stat-label">${escHtml(model.barLabel || 'Skor')}</div>
@@ -701,17 +718,18 @@
     function animateAssessment(container, score) {
       const ring = container.querySelector('.score-ring');
       const bar = container.querySelector('.grade-progress-fill');
-      const safeScore = Math.max(0, Math.min(100, Number(score || 0)));
+      const assessed = score !== null && score !== undefined;
+      const safeScore = assessed ? Math.max(0, Math.min(100, Number(score || 0))) : 0;
       setTimeout(() => {
         if (ring) {
           ring.style.setProperty('--score', safeScore);
-          ring.style.setProperty('--ring-color', ringColor(safeScore));
+          ring.style.setProperty('--ring-color', assessed ? ringColor(safeScore) : '#94a3b8');
           const grade = ring.querySelector('.score-grade');
-          if (grade) grade.style.color = ringColor(safeScore);
+          if (grade) grade.style.color = assessed ? ringColor(safeScore) : '#64748b';
         }
         if (bar) {
           bar.style.width = safeScore + '%';
-          bar.style.background = barGradient(safeScore);
+          bar.style.background = assessed ? barGradient(safeScore) : '#cbd5e1';
         }
       }, 80);
     }
@@ -938,8 +956,10 @@
       return {
         url: data.url || target.url || '',
         hostname: data.hostname || data.host || target.hostname || '—',
-        score: Number(data.score ?? 0),
-        grade: String(data.grade || gradeFromScore(Number(data.score || 0))),
+        score: data.score === null || data.score === undefined || data.score === '' ? null : Number(data.score),
+        grade: String(data.grade || (data.score === null ? 'N/A' : gradeFromScore(Number(data.score || 0)))),
+        assessment_status: String(data.assessment_status || ((data.score === null || data.grade === 'N/A') ? 'unavailable' : 'complete')),
+        assessment_reason: String(data.assessment_reason || ''),
         total_checks: Number(data.total_checks || findings.length || 0),
         passed: Number(data.passed ?? counts.passed),
         info: Number(data.info ?? counts.info),
@@ -1025,6 +1045,16 @@
 
     function buildPciModel(data) {
       const findings = Array.isArray(data.findings) ? data.findings : [];
+      if (data.assessment_status === 'unavailable') {
+        return {
+          controls: [],
+          total: 0,
+          counts: { critical:0, warning:0, info:0, pass:0 },
+          score: null,
+          grade: 'N/A',
+          status: 'Tidak dinilai'
+        };
+      }
       const controls = [
         makePciControl('Penghantaran Selamat (HTTPS/TLS)', matchFindings(findings, f => ['Transport','TLS/SSL'].includes(f.category) || /HTTPS|HSTS|Certificate|Protocol|Cipher|TLS|SSL/i.test(f.check)), 'Pastikan semua data dihantar melalui HTTPS/TLS yang kuat.'),
         makePciControl('Pengepala Keselamatan Pelayar', matchFindings(findings, f => f.category === 'Headers' && /Content-Security-Policy|Strict-Transport-Security|X-Frame-Options|X-Content-Type-Options|Referrer-Policy|Permissions-Policy/i.test(f.check)), 'Aktifkan pengepala keselamatan yang sesuai untuk halaman pembayaran.'),
@@ -1079,18 +1109,25 @@
       lines.push('Scan Time: ' + (data.scan_time || '-'));
       lines.push('Duration: ' + (data.duration || '-'));
       lines.push('IP pengimbas: ' + (data.scan_client_ip || '-'));
-      if (data.scan_blocked) {
+      if (data.assessment_status === 'unavailable') {
+        lines.push('Status scan: Tidak dinilai');
+        lines.push('Sebab: ' + (data.assessment_reason || 'Scan tidak lengkap.'));
+      } else if (data.scan_blocked) {
         const detail = data.scan_blocked_detail || {};
         lines.push('Status scan: ' + (detail.title || 'Disekat oleh captcha / halaman pengesahan'));
         lines.push('Tindakan: ' + (detail.message || 'Pengimbas tidak menerima HTML laman sebenar.'));
       }
       lines.push('');
       lines.push('SCAN KESELAMATAN');
-      lines.push(`Skor: ${data.score}/100 | Gred: ${data.grade} | Semakan: ${data.total_checks}`);
+      lines.push(data.score === null
+        ? `Skor: Tidak dinilai | Gred: N/A | Semakan: ${data.total_checks}`
+        : `Skor: ${data.score}/100 | Gred: ${data.grade} | Semakan: ${data.total_checks}`);
       lines.push(`Kritikal: ${data.critical} | Amaran: ${data.warnings} | Info: ${data.info} | Lulus: ${data.passed}`);
       lines.push('');
       lines.push('PCI DSS LITE');
-      lines.push(`Skor: ${pci.score}/100 | Gred: ${pci.grade} | Status: ${pci.status}`);
+      lines.push(pci.score === null
+        ? `Skor: Tidak dinilai | Gred: N/A | Status: ${pci.status}`
+        : `Skor: ${pci.score}/100 | Gred: ${pci.grade} | Status: ${pci.status}`);
       lines.push(`Kritikal: ${pci.counts.critical} | Amaran: ${pci.counts.warning} | Info: ${pci.counts.info} | Lulus: ${pci.counts.pass}`);
       lines.push('');
       lines.push('DAPATAN');
@@ -1180,7 +1217,7 @@
       <h2>Scan Keselamatan</h2>
       <div class="boxgrid">
         <div class="box"><span>Gred</span><b>${escHtml(data.grade)}</b></div>
-        <div class="box"><span>Skor</span><b>${data.score}/100</b></div>
+        <div class="box"><span>Skor</span><b>${data.score === null ? 'Tidak dinilai' : data.score + '/100'}</b></div>
         <div class="box"><span>Semakan</span><b>${data.total_checks}</b></div>
         <div class="box"><span>Lulus</span><b>${data.passed}</b></div>
       </div>
@@ -1195,7 +1232,7 @@
       <h2>PCI DSS Lite</h2>
       <div class="boxgrid">
         <div class="box"><span>Gred</span><b>${escHtml(pci.grade)}</b></div>
-        <div class="box"><span>Skor</span><b>${pci.score}/100</b></div>
+        <div class="box"><span>Skor</span><b>${pci.score === null ? 'Tidak dinilai' : pci.score + '/100'}</b></div>
         <div class="box"><span>Kawalan</span><b>${pci.total}</b></div>
         <div class="box"><span>Status</span><b>${escHtml(pci.status)}</b></div>
       </div>

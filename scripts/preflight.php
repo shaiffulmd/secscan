@@ -49,6 +49,15 @@ echo "============================================================" . $nl;
 // ---- 1. Versi PHP -------------------------------------------------
 echo $nl . "1. Versi PHP" . $nl;
 res(PHP_VERSION_ID >= 80100 ? 'PASS' : 'WARN', 'PHP 8.1+', PHP_VERSION);
+// PHP2Shell (CVE-2026-109618, CVE-2026-109619): this host also runs PHP.
+$php2shellFixed = ['8.2' => '8.2.35', '8.3' => '8.3.36', '8.4' => '8.4.27', '8.5' => '8.5.12'][PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION] ?? null;
+if (PHP_VERSION_ID < 80200) {
+    res('WARN', 'PHP2Shell', 'cawangan ini tiada keluaran rasmi yang dibaiki; naik taraf ke PHP 8.3+');
+} elseif ($php2shellFixed !== null && version_compare(PHP_VERSION, $php2shellFixed, '<')) {
+    res('WARN', 'PHP2Shell', "naik taraf ke {$php2shellFixed}, atau sahkan backport distro dalam changelog pakej");
+} else {
+    res('PASS', 'PHP2Shell', 'versi ini tidak berada dalam julat terjejas');
+}
 
 // ---- 2. Sambungan PHP wajib --------------------------------------
 echo $nl . "2. Sambungan PHP" . $nl;
