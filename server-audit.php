@@ -136,6 +136,7 @@ $auditHash = hash_file('sha256', __DIR__ . '/audit.sh') ?: '';
       <span>&copy; 2026 SecScan Enterprise. Hak cipta terpelihara.</span>
       <nav class="footer-links" aria-label="Pautan SecScan">
         <a href="index.php">Scanner</a>
+        <a href="updates.php">Kemas Kini</a>
         <a href="faqs.php">FAQ</a>
         <a href="dashboard.php">Papan Pemuka</a>
       </nav>

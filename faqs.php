@@ -168,6 +168,7 @@ $appVersion = secscan_app_version();
       <span class="footer-version">Versi <?= htmlspecialchars($appVersion, ENT_QUOTES, 'UTF-8') ?></span>
       <nav class="footer-links" aria-label="Pautan SecScan">
         <a href="index.php">Scanner</a>
+        <a href="updates.php">Kemas Kini</a>
         <a href="server-audit.php">Audit Server</a>
         <a href="dashboard.php">Papan Pemuka</a>
         <a href="about.php">Tentang</a>

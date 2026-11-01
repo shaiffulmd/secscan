@@ -1399,3 +1399,16 @@ body.enterprise-ui {
     justify-content: flex-start;
   }
 }
+
+/* Release notes: updates.php and the home page notice */
+.enterprise-ui .updates-list { display: grid; gap: 16px; max-width: 760px; margin: 56px auto 0; }
+.enterprise-ui .updates-entry { padding: 30px; border: 1px solid var(--border); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow-sm); }
+.enterprise-ui .updates-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin: 0; color: var(--t2); font-size: .82rem; }
+.enterprise-ui .updates-version { color: var(--clay); font-family: var(--f-mono); font-weight: 500; }
+.enterprise-ui .updates-entry h2 { margin: 10px 0 14px; color: var(--t1); font-size: 1.3rem; line-height: 1.3; }
+.enterprise-ui .updates-entry ul { display: grid; gap: 9px; margin: 0; padding-left: 20px; color: var(--t2); font-size: .94rem; line-height: 1.65; }
+.enterprise-ui .updates-action { margin: 18px 0 0; padding: 14px 16px; border: 1px solid var(--clay-border); border-radius: 12px; background: var(--clay-soft); color: var(--t1); font-size: .9rem; line-height: 1.65; overflow-wrap: anywhere; }
+.enterprise-ui .latest-update { display: inline-flex; align-items: center; gap: 10px; width: fit-content; max-width: 100%; margin-bottom: 18px; padding: 6px 14px 6px 6px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--t2); font-size: .82rem; line-height: 1.35; text-decoration: none; }
+.enterprise-ui .latest-update:hover, .enterprise-ui .latest-update:focus-visible { border-color: var(--clay-border); color: var(--t1); }
+.enterprise-ui .latest-update-tag { flex: none; padding: 3px 9px; border-radius: 999px; background: var(--clay-soft); color: var(--clay); font-weight: 600; }
+@media (max-width: 760px) { .enterprise-ui .updates-entry { padding: 22px; } .enterprise-ui .updates-list { margin-top: 36px; } }

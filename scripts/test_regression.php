@@ -348,6 +348,19 @@ $assertSame('critical', $stackFindings['PHP2Shell Exposure']['severity'] ?? null
 $assertSame('warning', $stackFindings['Outdated nginx']['severity'] ?? null, 'nginx 1.28 should now be flagged as outdated.');
 $assert(!isset($stackFindings['Software Currency']), 'The all-clear finding must not appear beside real version findings.');
 
+require_once dirname(__DIR__) . '/src/Changelog.php';
+$assertSame(trim((string)file_get_contents(dirname(__DIR__) . '/VERSION')), Changelog::latest()['version'], 'The newest changelog entry must match the VERSION file.');
+$assertSame('1 November 2026', Changelog::formatDate('2026-11-01'), 'Changelog dates should be written in Malay.');
+$assertSame('10 Julai 2026', Changelog::formatDate('2026-07-10'), 'Changelog dates should be written in Malay.');
+$changelogDates = array_column(Changelog::ENTRIES, 'date');
+$changelogDatesSorted = $changelogDates;
+rsort($changelogDatesSorted);
+$assertSame($changelogDatesSorted, $changelogDates, 'Changelog entries must be ordered newest first.');
+$assertSame(count(Changelog::ENTRIES), count(array_unique(array_column(Changelog::ENTRIES, 'version'))), 'Changelog versions must be unique.');
+foreach (Changelog::ENTRIES as $changelogEntry) {
+    $assert($changelogEntry['title'] !== '' && $changelogEntry['items'] !== [], "Changelog entry {$changelogEntry['version']} needs a title and at least one item.");
+}
+
 $mtaStsAdvice = new SecurityScanner('https://8.8.8.8');
 $ref->getProperty('hostname')->setValue($mtaStsAdvice, 'no-such-domain.invalid');
 $ref->getMethod('checkMTASTS')->invoke($mtaStsAdvice);

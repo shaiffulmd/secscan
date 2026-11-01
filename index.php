@@ -6,6 +6,7 @@
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/src/RateLimiter.php';
 require_once __DIR__ . '/src/UrlGuard.php';
+require_once __DIR__ . '/src/Changelog.php';
 
 header_remove('X-Powered-By');
 $requestMethod = $_SERVER['REQUEST_METHOD'] ?? 'GET';
@@ -246,6 +247,7 @@ $scannerIdentity = secscan_scanner_identity();
 $scannerAllowlistConfigured = !empty($scannerIdentity['configured']);
 $scannerAllowlistText = (string)($scannerIdentity['allowlist_text'] ?? '');
 $appVersion = secscan_app_version();
+$latestUpdate = Changelog::latest();
 ?>
 <!DOCTYPE html>
 <html lang="ms">
@@ -303,6 +305,12 @@ $appVersion = secscan_app_version();
       <section class="hero">
         <div class="hero-layout">
           <div class="hero-main">
+
+        <a class="latest-update" href="updates.php">
+          <span class="latest-update-tag">Baharu</span>
+          <span><?= htmlspecialchars($latestUpdate['title'], ENT_QUOTES, 'UTF-8') ?> · <?= htmlspecialchars(Changelog::formatDate($latestUpdate['date']), ENT_QUOTES, 'UTF-8') ?></span>
+          <span aria-hidden="true">→</span>
+        </a>
 
         <div class="eyebrow">
           <span class="eyebrow-dot" aria-hidden="true">&#8203;</span>
@@ -593,6 +601,7 @@ $appVersion = secscan_app_version();
         <a href="#terma" data-legal-modal="terms">Terma</a>
         <a href="#privasi" data-legal-modal="privacy">Privasi</a>
         <a href="#penafian" data-legal-modal="disclaimer">Penafian</a>
+        <a href="updates.php">Kemas Kini</a>
         <a href="faqs.php">FAQ</a>
         <a href="about.php">Tentang</a>
         <a href="server-audit.php">Audit Server</a>
