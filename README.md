@@ -105,6 +105,11 @@ timestamp and one-time nonce; it never accepts browser requests directly.
 Keep the worker behind a firewall/VPN where possible and do not enable
 authenticated scans unless both servers are access-controlled.
 
+## Auto-deploy
+
+Pushing to `main` runs the tests and then updates the VPS through GitHub Actions.
+See [docs/auto-deploy.md](docs/auto-deploy.md) for the one-time setup.
+
 ## Safety Notes
 
 SecScan performs outbound HTTP, TLS, DNS, and limited port checks. Keep rate limits enabled, avoid exposing the API without access controls on high-traffic deployments, and only scan systems you are allowed to assess.
