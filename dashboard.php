@@ -9,6 +9,16 @@
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/src/RateLimiter.php';
 
+header_remove('X-Powered-By');
+$requestMethod = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+if (!in_array($requestMethod, ['GET', 'HEAD', 'POST'], true)) {
+    header('Allow: GET, HEAD, POST');
+    header('X-Content-Type-Options: nosniff');
+    header('Cache-Control: no-store');
+    http_response_code(405);
+    exit;
+}
+
 define('DASHBOARD_PASSWORD_HASH', (string)secscan_config('dashboard_password_hash'));
 
 define('SESSION_NAME',    'secscan_dash');
@@ -26,7 +36,8 @@ if (!extension_loaded('pdo_sqlite')) {
 
 session_name(SESSION_NAME);
 $isHttps = secscan_is_https();
-$requestMethod = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+ini_set('session.use_strict_mode', '1');
+ini_set('session.use_only_cookies', '1');
 session_set_cookie_params([
     'lifetime' => 0,
     'path'     => '/',
@@ -42,7 +53,12 @@ if (empty($_SESSION['csrf_token'])) {
 // Expire session selepas SESSION_TIMEOUT saat
 if (isset($_SESSION['last_active']) && (time() - $_SESSION['last_active']) > SESSION_TIMEOUT) {
     secscan_forget_owner_bypass_ip((string)($_SESSION['owner_bypass_ip'] ?? secscan_client_ip()));
-    session_unset(); session_destroy(); session_start();
+    session_unset(); session_destroy(); session_start(); session_regenerate_id(true);
+}
+// session_destroy() above clears the token; make sure the fresh session is safe
+// to render before a login or logout form accesses it.
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 }
 if (isset($_SESSION['auth'])) {
     $_SESSION['last_active'] = time();
@@ -109,6 +125,7 @@ header_remove('X-Powered-By');
 header('X-Content-Type-Options: nosniff');
 header('X-Frame-Options: DENY');
 header('Referrer-Policy: no-referrer');
+header('Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()');
 header('Cache-Control: no-store, private, max-age=0');
 header("Content-Security-Policy: default-src 'self'; form-action 'self'; script-src 'nonce-{$nonce}' https://cdn.jsdelivr.net; style-src 'self' 'nonce-{$nonce}' https://cdn.jsdelivr.net; style-src-attr 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; report-to default; report-uri /reporting.php");
 secscan_send_operational_security_headers();
@@ -137,7 +154,7 @@ $domainSuffixStats = [];
 $latestDomainScans = [];
 $latestDomainCount = 0;
 $domainListPageSize = 25;
-$domainListGradeOptions = ['all', 'A+', 'A', 'B', 'C', 'D', 'F'];
+$domainListGradeOptions = ['all', 'A+', 'A', 'B', 'C', 'D', 'F', 'N/A'];
 $domainListGrade = (string)($_GET['domain_grade'] ?? 'all');
 if (!in_array($domainListGrade, $domainListGradeOptions, true)) $domainListGrade = 'all';
 $domainListSort = (string)($_GET['domain_sort'] ?? 'recent');
@@ -146,7 +163,10 @@ $domainListPage = max(1, (int)($_GET['domains_p'] ?? 1));
 $geoIpStatus = ['available' => false, 'records' => 0, 'updated_at' => ''];
 $geoIpMessage = '';
 $geoIpMessageTone = '';
+$contactMessageNotice = '';
+$contactMessageTone = '';
 $logger = null;
+$contactMessages = [];
 $pageSize    = 50;
 $page        = max(1, (int)($_GET['p'] ?? 1));
 $currentClientIp = secscan_client_ip();
@@ -164,6 +184,20 @@ if ($isLoggedIn) {
             $geoIpMessage = (string)$update['message'];
             $geoIpMessageTone = !empty($update['ok']) ? 'good' : 'bad';
         }
+        if ($requestMethod === 'POST' && isset($_POST['contact_delete'])
+            && is_string($_POST['csrf_token'] ?? null)
+            && hash_equals((string)$_SESSION['csrf_token'], $_POST['csrf_token'])) {
+            $selected = $_POST['contact_ids'] ?? [];
+            $selected = is_array($selected) ? array_slice($selected, 0, 100) : [];
+            $deleted = $logger->deleteContactMessages($selected);
+            if ($deleted > 0) {
+                $contactMessageNotice = "{$deleted} mesej telah dipadam secara kekal.";
+                $contactMessageTone = 'good';
+            } else {
+                $contactMessageNotice = 'Pilih sekurang-kurangnya satu mesej untuk dipadam.';
+                $contactMessageTone = 'bad';
+            }
+        }
         $summary     = $logger->getSummary();
         $grades      = $logger->getGradeDistribution();
         $dailyScans  = $logger->getDailyScans(30);
@@ -180,6 +214,10 @@ if ($isLoggedIn) {
         $latestDomainCount = $logger->getLatestDomainScanCount($domainListGrade);
         $latestDomainScans = $logger->getLatestDomainScans($domainListGrade, $domainListSort, $domainListPageSize, ($domainListPage - 1) * $domainListPageSize);
         $geoIpStatus = $logger->getGeoIpStatus();
+        $contactKey = base64_decode((string)secscan_config('contact_encryption_key'), true);
+        if (is_string($contactKey) && strlen($contactKey) === 32) {
+            $contactMessages = $logger->getContactMessages($contactKey, 30);
+        }
     }
 }
 
@@ -188,9 +226,18 @@ if ($isLoggedIn) {
 // ----------------------------------------------------------------
 
 function gradeColor(string $g): string {
+    // One distinct hue per grade, stepping good -> bad. A+ and A were both
+    // #00ffcc (indistinguishable in the donut); C/D were near-identical ambers.
+    // Deep vs light green, then blue, yellow, orange, red keeps every adjacent
+    // slice readable and avoids relying on a single green/amber shade.
     return match($g) {
-        'A+', 'A' => '#00ffcc', 'B' => '#38bdf8', 'C' => '#f59e0b',
-        'D' => '#fb923c', 'F' => '#f43f5e', default => '#5a8aaa',
+        'A+' => '#059669', // emerald-600 (deep green, best)
+        'A'  => '#34d399', // emerald-400 (light green)
+        'B'  => '#38bdf8', // sky-400 (blue)
+        'C'  => '#facc15', // yellow-400
+        'D'  => '#f97316', // orange-500
+        'F'  => '#ef4444', // red-500
+        default => '#94a3b8', // slate-400 (unknown/other)
     };
 }
 
@@ -264,6 +311,7 @@ $totalPages = (int)ceil($totalCount / $pageSize);
 $totalScans = (int)($summary['total_scans'] ?? 0);
 $avgScore = is_numeric($summary['avg_score'] ?? null) ? (float)$summary['avg_score'] : null;
 $avgGrade = scoreToGrade($avgScore);
+$unassessedTotal = (int)($summary['unassessed_total'] ?? ($grades['N/A'] ?? 0));
 $criticalTotal = (int)($summary['total_critical'] ?? 0);
 $criticalScans = (int)($summary['scans_with_criticals'] ?? 0);
 $uniqueIps = (int)($summary['unique_ips'] ?? 0);
@@ -293,18 +341,22 @@ if ($cdnDomains === []) {
                 'avg_score' => 0,
                 'waf_vendors' => (string)($scan['waf_vendors'] ?? ''),
                 '_score_sum' => 0,
+                '_score_count' => 0,
             ];
         }
         $cdnMap[$host]['scan_count']++;
-        $cdnMap[$host]['_score_sum'] += (float)($scan['score'] ?? 0);
+        if ((string)($scan['grade'] ?? '') !== 'N/A') {
+            $cdnMap[$host]['_score_sum'] += (float)($scan['score'] ?? 0);
+            $cdnMap[$host]['_score_count']++;
+        }
         if (strcmp((string)($scan['scanned_at'] ?? ''), (string)$cdnMap[$host]['last_scan']) > 0) {
             $cdnMap[$host]['last_scan'] = (string)$scan['scanned_at'];
             $cdnMap[$host]['waf_vendors'] = (string)($scan['waf_vendors'] ?? '');
         }
     }
     foreach ($cdnMap as &$row) {
-        $row['avg_score'] = $row['scan_count'] > 0 ? round($row['_score_sum'] / $row['scan_count'], 1) : 0;
-        unset($row['_score_sum']);
+        $row['avg_score'] = $row['_score_count'] > 0 ? round($row['_score_sum'] / $row['_score_count'], 1) : null;
+        unset($row['_score_sum'], $row['_score_count']);
     }
     unset($row);
     $cdnDomains = array_values($cdnMap);
@@ -336,6 +388,49 @@ $readiness = [
     ['Header Policy', max(18, min(90, (int)round(($avgScore ?? 56) * .74)))],
     ['CMS Hygiene', max(18, min(94, (int)round(($avgScore ?? 56) * .82)))],
 ];
+
+// Dashboard charts use the same logged scan data as the summary cards.
+$gradeOrder = ['A+', 'A', 'B', 'C', 'D', 'F'];
+$gradeCounts = [];
+foreach ($gradeOrder as $grade) {
+    $gradeCounts[$grade] = (int)($grades[$grade] ?? 0);
+}
+$gradeChartTotal = array_sum($gradeCounts);
+$gradeAtRisk = $gradeCounts['C'] + $gradeCounts['D'] + $gradeCounts['F'];
+$gradeStops = [];
+$gradeCursor = 0.0;
+foreach ($gradeCounts as $grade => $count) {
+    if ($count === 0 || $gradeChartTotal === 0) continue;
+    $next = $gradeCursor + ($count / $gradeChartTotal * 100);
+    $gradeStops[] = gradeColor($grade) . ' ' . number_format($gradeCursor, 3, '.', '') . '% ' . number_format($next, 3, '.', '') . '%';
+    $gradeCursor = $next;
+}
+$gradeDonutStyle = $gradeStops === []
+    ? 'background: var(--elevated);'
+    : 'background: conic-gradient(' . implode(', ', $gradeStops) . ');';
+
+$dailyValues = array_values($dailyScans);
+$dailyDays = array_keys($dailyScans);
+$dailyMax = $dailyValues === [] ? 1 : max($dailyValues);
+$dailyPoints = [];
+$dailyPointCount = count($dailyValues);
+foreach ($dailyValues as $index => $count) {
+    $x = $dailyPointCount > 1 ? 20 + ($index * 560 / ($dailyPointCount - 1)) : 300;
+    $y = 138 - ((int)$count / $dailyMax * 100);
+    $dailyPoints[] = number_format($x, 1, '.', '') . ',' . number_format($y, 1, '.', '');
+}
+$dailyPolyline = implode(' ', $dailyPoints);
+$dailyArea = $dailyPolyline === '' ? '' : '20,138 ' . $dailyPolyline . ' 580,138';
+$dailyStartLabel = $dailyDays !== [] ? date('j M', strtotime((string)$dailyDays[0])) : '—';
+$dailyEndLabel = $dailyDays !== [] ? date('j M', strtotime((string)$dailyDays[count($dailyDays) - 1])) : '—';
+$scoreBands = [
+    ['90–100', (int)($scoreDist['s90'] ?? 0), 'Strong', 'good'],
+    ['70–89', (int)($scoreDist['s70'] ?? 0), 'Monitor', 'info'],
+    ['50–69', (int)($scoreDist['s50'] ?? 0), 'Needs review', 'warn'],
+    ['0–49', (int)($scoreDist['s0'] ?? 0), 'Critical risk', 'bad'],
+    ['N/A', $unassessedTotal, 'Tidak dinilai', 'info'],
+];
+$scoreBandTotal = array_sum(array_column($scoreBands, 1));
 ?>
 <!DOCTYPE html>
 <html lang="ms">
@@ -879,6 +974,33 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
   font-weight: 860;
 }
 .metric-caption { margin-top: 7px; color: var(--t3); font-size: .78rem; line-height: 1.35; }
+.dashboard-section-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 16px;
+  padding: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--surface) 82%, var(--elevated));
+  box-shadow: var(--shadow-sm);
+}
+.dashboard-section-tab {
+  min-height: 36px;
+  flex: 0 0 auto;
+  padding: 0 13px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--t2);
+  font-size: .82rem;
+  font-weight: 760;
+  cursor: pointer;
+}
+.dashboard-section-tab:hover { color: var(--t1); background: var(--elevated); }
+.dashboard-section-tab[aria-selected="true"] { background: var(--t1); color: var(--surface); }
+.dashboard-view:focus { outline: none; }
 @media (min-width: 1220px) {
   .sidebar-collapsed .metrics {
     grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -928,6 +1050,11 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
   gap: 16px;
   align-items: start;
 }
+.dash-grid.is-single-column { grid-template-columns: 1fr; }
+.dash-grid.is-single-column > aside.stack,
+.dash-grid.is-operations > section.stack { display: none; }
+.dash-grid.is-operations { grid-template-columns: 1fr; }
+.dash-grid.is-operations > aside.stack { width: 100%; }
 .stack { display: grid; gap: 16px; }
 .panel {
   border: 1px solid var(--border);
@@ -968,6 +1095,67 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
 .risk-high { background: rgba(185,28,28,.10); border-color: rgba(185,28,28,.24); }
 .risk-med { background: rgba(180,83,9,.11); border-color: rgba(180,83,9,.28); }
 .risk-low { background: rgba(21,128,61,.10); border-color: rgba(21,128,61,.26); }
+.analytics-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+.analytics-grid .wide { grid-column: 1 / -1; }
+.chart-body { padding: 16px; }
+.grade-chart {
+  display: grid;
+  grid-template-columns: 156px minmax(0, 1fr);
+  gap: 18px;
+  align-items: center;
+}
+.grade-donut {
+  width: 156px;
+  aspect-ratio: 1;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  position: relative;
+}
+.grade-donut::after {
+  content: '';
+  width: 104px;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.grade-donut-center {
+  position: absolute;
+  z-index: 1;
+  display: grid;
+  gap: 2px;
+  text-align: center;
+}
+.grade-donut-center strong { color: var(--t1); font-size: 1.45rem; line-height: 1; }
+.grade-donut-center span { color: var(--t3); font-size: .68rem; }
+.grade-legend { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
+.grade-legend-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--t2); font-size: .78rem; }
+.grade-key { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.grade-key i { width: 9px; height: 9px; flex: 0 0 auto; border-radius: 999px; background: var(--grade-color); }
+.grade-legend-row strong { color: var(--t1); font-size: .78rem; white-space: nowrap; }
+.trend-chart { display: grid; gap: 8px; }
+.trend-chart svg { width: 100%; height: auto; display: block; overflow: visible; }
+.trend-grid { stroke: var(--border); stroke-width: 1; }
+.trend-axis { stroke: var(--border2); stroke-width: 1; }
+.trend-area { fill: var(--mint2); }
+.trend-line { fill: none; stroke: var(--mint); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+.trend-dot { fill: var(--mint); stroke: var(--surface); stroke-width: 3; }
+.trend-labels { display: flex; justify-content: space-between; color: var(--t3); font-size: .7rem; }
+.score-band-list { display: grid; gap: 13px; }
+.score-band-row { display: grid; grid-template-columns: 54px minmax(0, 1fr) auto; gap: 10px; align-items: center; color: var(--t2); font-size: .78rem; }
+.score-band-range { color: var(--t1); font-family: var(--f-mono); font-weight: 700; }
+.score-band-track { height: 10px; overflow: hidden; border-radius: 999px; background: var(--elevated); }
+.score-band-fill { height: 100%; width: var(--band-width); border-radius: inherit; background: var(--band-color); }
+.score-band-count { color: var(--t1); font-weight: 760; white-space: nowrap; }
+.score-band-row.good { --band-color: var(--green); }
+.score-band-row.info { --band-color: var(--sky); }
+.score-band-row.warn { --band-color: var(--amber); }
+.score-band-row.bad { --band-color: var(--rose); }
 .timeline { padding: 14px 16px 16px; display: grid; gap: 12px; }
 .event {
   display: grid;
@@ -1120,6 +1308,12 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
   border-color: color-mix(in srgb, var(--mint) 38%, var(--border));
   background: var(--mint2);
 }
+.contact-delete-form { display: grid; gap: 0; }
+.contact-delete-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border-top: 1px solid var(--border); }
+.contact-select { width: 16px; height: 16px; accent-color: var(--mint); cursor: pointer; }
+.btn-danger { min-height: 34px; padding: 0 12px; border: 1px solid rgba(185,28,28,.38); border-radius: var(--r-sm); background: rgba(185,28,28,.08); color: var(--rose); font: inherit; font-size: .76rem; font-weight: 800; cursor: pointer; }
+.btn-danger:hover { background: rgba(185,28,28,.15); }
+.contact-delete-note { color: var(--t3); font-size: .76rem; }
 @media (max-width: 1120px) {
   .dash-grid { grid-template-columns: 1fr; }
   .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1141,12 +1335,18 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
   .dashboard-header { grid-template-columns: 1fr; }
   .dashboard-actions { justify-content: flex-start; }
   .heatmap { grid-template-columns: repeat(3, 1fr); }
+  .analytics-grid { grid-template-columns: 1fr; }
+  .dashboard-section-nav { gap: 6px; }
 }
 @media (max-width: 560px) {
   .enterprise-topbar { align-items: flex-start; flex-direction: column; padding-bottom: 12px; }
   .top-actions { justify-content: flex-start; }
   .metrics { grid-template-columns: 1fr; }
+  .dashboard-section-nav { margin-bottom: 14px; }
+  .dashboard-section-tab { min-height: 38px; padding: 0 12px; }
   .heatmap { grid-template-columns: repeat(2, 1fr); }
+  .grade-chart { grid-template-columns: 1fr; justify-items: center; }
+  .grade-legend { width: 100%; }
   .geoip-layout { grid-template-columns: 1fr; }
   .domain-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .readiness-row { grid-template-columns: 94px minmax(0, 1fr) 34px; }
@@ -1258,14 +1458,14 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
         <div class="metric-label"><span>Total Scans</span><span class="pill info">30d</span></div>
         <div>
           <div class="metric-number"><?= number_format($totalScans) ?></div>
-          <div class="metric-caption">Across <?= number_format($domainTotal) ?> monitored domains</div>
+          <div class="metric-caption">Across <?= number_format($domainTotal) ?> monitored domains · <?= number_format($unassessedTotal) ?> tidak dinilai</div>
         </div>
       </article>
       <article class="metric">
         <div class="metric-label"><span>Average Security Grade</span><span class="pill <?= $gradeTone ?>"><?= htmlspecialchars($avgGrade) ?></span></div>
         <div>
           <div class="metric-number"><?= htmlspecialchars($avgGrade) ?></div>
-          <div class="metric-caption"><?= $avgScore !== null ? htmlspecialchars((string)$avgScore) : 'No' ?> average score across recent scans</div>
+          <div class="metric-caption"><?= $avgScore !== null ? htmlspecialchars((string)$avgScore) . ' average score daripada scan dinilai' : 'Tiada scan lengkap yang boleh dinilai' ?></div>
         </div>
       </article>
       <article class="metric">
@@ -1291,9 +1491,18 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
       </article>
     </section>
 
+    <nav class="dashboard-section-nav" role="tablist" aria-label="Bahagian dashboard">
+      <button class="dashboard-section-tab" id="dashboard-tab-overview" type="button" role="tab" aria-selected="true" aria-controls="dashboard-view" data-dashboard-tab-button="overview">Ringkasan</button>
+      <button class="dashboard-section-tab" id="dashboard-tab-analytics" type="button" role="tab" aria-selected="false" aria-controls="dashboard-view" tabindex="-1" data-dashboard-tab-button="analytics">Analitik</button>
+      <button class="dashboard-section-tab" id="dashboard-tab-inventory" type="button" role="tab" aria-selected="false" aria-controls="dashboard-view" tabindex="-1" data-dashboard-tab-button="inventory">Inventori</button>
+      <button class="dashboard-section-tab" id="dashboard-tab-activity" type="button" role="tab" aria-selected="false" aria-controls="dashboard-view" tabindex="-1" data-dashboard-tab-button="activity">Aktiviti & Audit</button>
+      <button class="dashboard-section-tab" id="dashboard-tab-operations" type="button" role="tab" aria-selected="false" aria-controls="dashboard-view" tabindex="-1" data-dashboard-tab-button="operations">Tindakan</button>
+    </nav>
+
+    <div class="dashboard-view" id="dashboard-view" role="tabpanel" aria-labelledby="dashboard-tab-overview" tabindex="-1">
     <div class="dash-grid">
       <section class="stack">
-        <article class="panel">
+        <article class="panel" data-dashboard-tabs="overview">
           <div class="panel-head">
             <div>
               <h2 class="panel-title">Exposure Heatmap</h2>
@@ -1308,7 +1517,77 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
           </div>
         </article>
 
-        <article class="panel">
+        <section class="analytics-grid" aria-label="Analitik keselamatan" data-dashboard-tabs="analytics" hidden>
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <h2 class="panel-title">Agihan Gred Keselamatan</h2>
+                <p class="panel-sub">Peratusan semua scan bagi gred A+ hingga F.</p>
+              </div>
+              <span class="pill <?= $gradeAtRisk > 0 ? 'warn' : 'good' ?>"><?= number_format($gradeAtRisk) ?> perlu semakan · <?= number_format($unassessedTotal) ?> N/A</span>
+            </div>
+            <div class="chart-body grade-chart">
+              <div class="grade-donut" style="<?= htmlspecialchars($gradeDonutStyle, ENT_QUOTES) ?>" role="img" aria-label="Agihan gred daripada <?= number_format($gradeChartTotal) ?> scan">
+                <div class="grade-donut-center"><strong><?= number_format($gradeChartTotal) ?></strong><span>scan dinilai</span></div>
+              </div>
+              <div class="grade-legend" aria-label="Nilai peratusan bagi setiap gred">
+                <?php foreach ($gradeCounts as $grade => $count):
+                  $percentage = $gradeChartTotal > 0 ? (int)round($count / $gradeChartTotal * 100) : 0;
+                ?>
+                  <div class="grade-legend-row">
+                    <span class="grade-key"><i aria-hidden="true" style="--grade-color: <?= htmlspecialchars(gradeColor($grade), ENT_QUOTES) ?>"></i>Gred <?= htmlspecialchars($grade) ?></span>
+                    <strong><?= $percentage ?>% <span class="sr-only">(<?= number_format($count) ?> scan)</span></strong>
+                  </div>
+                <?php endforeach; ?>
+              </div>
+            </div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <h2 class="panel-title">Trend Aktiviti Scan</h2>
+                <p class="panel-sub">Jumlah scan harian untuk 30 hari terakhir.</p>
+              </div>
+              <span class="pill info"><?= number_format(array_sum($dailyValues)) ?> scan</span>
+            </div>
+            <div class="chart-body trend-chart">
+              <svg viewBox="0 0 600 154" role="img" aria-labelledby="scanTrendTitle scanTrendDesc">
+                <title id="scanTrendTitle">Trend aktiviti scan selama 30 hari</title>
+                <desc id="scanTrendDesc">Bilangan scan harian dengan nilai tertinggi <?= number_format($dailyMax) ?> scan.</desc>
+                <line class="trend-grid" x1="20" y1="38" x2="580" y2="38"></line>
+                <line class="trend-grid" x1="20" y1="88" x2="580" y2="88"></line>
+                <line class="trend-axis" x1="20" y1="138" x2="580" y2="138"></line>
+                <?php if ($dailyArea !== ''): ?><polygon class="trend-area" points="<?= htmlspecialchars($dailyArea, ENT_QUOTES) ?>"></polygon><?php endif; ?>
+                <?php if ($dailyPolyline !== ''): ?><polyline class="trend-line" points="<?= htmlspecialchars($dailyPolyline, ENT_QUOTES) ?>"></polyline><?php endif; ?>
+              </svg>
+              <div class="trend-labels"><span><?= htmlspecialchars($dailyStartLabel) ?></span><span>maks <?= number_format($dailyMax) ?> scan/hari</span><span><?= htmlspecialchars($dailyEndLabel) ?></span></div>
+            </div>
+          </article>
+
+          <article class="panel wide">
+            <div class="panel-head">
+              <div>
+                <h2 class="panel-title">Julat Skor Keselamatan</h2>
+                <p class="panel-sub">Keutamaan tindakan berdasarkan skor keselamatan; scan tidak lengkap dipisahkan sebagai N/A.</p>
+              </div>
+              <span class="pill <?= $scoreBands[3][1] > 0 ? 'bad' : 'good' ?>"><?= number_format($scoreBands[3][1]) ?> risiko kritikal</span>
+            </div>
+            <div class="chart-body score-band-list" role="img" aria-label="Agihan skor keselamatan daripada 0 hingga 100 dan scan tidak dinilai">
+              <?php foreach ($scoreBands as [$range, $count, $label, $tone]):
+                $width = $scoreBandTotal > 0 ? max($count > 0 ? 3 : 0, $count / $scoreBandTotal * 100) : 0;
+              ?>
+                <div class="score-band-row <?= htmlspecialchars($tone) ?>" style="--band-width: <?= number_format($width, 2, '.', '') ?>%">
+                  <span class="score-band-range"><?= htmlspecialchars($range) ?></span>
+                  <div class="score-band-track" aria-hidden="true"><div class="score-band-fill"></div></div>
+                  <span class="score-band-count"><?= number_format($count) ?> · <?= htmlspecialchars($label) ?></span>
+                </div>
+              <?php endforeach; ?>
+            </div>
+          </article>
+        </section>
+
+        <article class="panel" data-dashboard-tabs="inventory" hidden>
           <div class="panel-head">
             <div>
               <h2 class="panel-title">Statistik Domain</h2>
@@ -1326,7 +1605,7 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
           </div>
         </article>
 
-        <article class="panel">
+        <article class="panel" data-dashboard-tabs="inventory" hidden>
           <div class="panel-head">
             <div>
               <h2 class="panel-title">Peta Negara Scanner</h2>
@@ -1350,6 +1629,7 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
                 <option value="C">Gred C</option>
                 <option value="D">Gred D</option>
                 <option value="F">Gred F</option>
+                <option value="N/A">Tidak dinilai (N/A)</option>
               </select>
               <label class="sr-only" for="geoMetricFilter">Ukuran peta</label>
               <select class="geoip-select" id="geoMetricFilter">
@@ -1363,7 +1643,7 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
               <div class="geoip-countries" id="geoCountryList" aria-label="Negara scanner utama">
                 <?php foreach (array_slice($countryStats, 0, 10) as $country): ?>
                   <div class="geoip-country">
-                    <div><strong><?= htmlspecialchars(countryLabel((string)$country['country'])) ?></strong><br><span><?= htmlspecialchars((string)$country['country']) ?> · skor <?= htmlspecialchars((string)$country['avg_score']) ?></span></div>
+                    <div><strong><?= htmlspecialchars(countryLabel((string)$country['country'])) ?></strong><br><span><?= htmlspecialchars((string)$country['country']) ?> · skor <?= $country['avg_score'] === null ? 'N/A' : htmlspecialchars((string)$country['avg_score']) ?></span></div>
                     <strong><?= number_format((int)$country['cnt']) ?> domain</strong>
                   </div>
                 <?php endforeach; ?>
@@ -1391,7 +1671,7 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
           <p class="panel-sub" style="margin-top:8px">Fail GeoIP dimuat turun dan disimpan pada server, bukan ke komputer pelayar. Proses pertama boleh mengambil beberapa minit.</p>
         </article>
 
-        <article class="panel" id="domain-grade-list">
+        <article class="panel" id="domain-grade-list" data-dashboard-tabs="inventory" hidden>
           <div class="panel-head">
             <div>
               <h2 class="panel-title">Senarai Web Mengikut Gred</h2>
@@ -1402,8 +1682,8 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
               <label class="sr-only" for="domainGradeFilter">Tapis senarai web mengikut gred</label>
               <select class="geoip-select" id="domainGradeFilter" name="domain_grade">
                 <option value="all"<?= $domainListGrade === 'all' ? ' selected' : '' ?>>Semua gred</option>
-                <?php foreach (['A+', 'A', 'B', 'C', 'D', 'F'] as $grade): ?>
-                  <option value="<?= htmlspecialchars($grade, ENT_QUOTES) ?>"<?= $domainListGrade === $grade ? ' selected' : '' ?>>Gred <?= htmlspecialchars($grade) ?></option>
+                <?php foreach (['A+', 'A', 'B', 'C', 'D', 'F', 'N/A'] as $grade): ?>
+                  <option value="<?= htmlspecialchars($grade, ENT_QUOTES) ?>"<?= $domainListGrade === $grade ? ' selected' : '' ?>><?= $grade === 'N/A' ? 'Tidak dinilai (N/A)' : 'Gred ' . htmlspecialchars($grade) ?></option>
                 <?php endforeach; ?>
               </select>
               <label class="sr-only" for="domainSortFilter">Susun senarai web</label>
@@ -1431,7 +1711,12 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
                   <tr>
                     <td><div class="domain"><strong><?= htmlspecialchars($host) ?></strong><a class="target-url" href="<?= htmlspecialchars($targetUrl) ?>" target="_blank" rel="noopener noreferrer"><?= htmlspecialchars($targetUrl) ?></a></div></td>
                     <td><span class="pill <?= $gradeClass ?>"><?= htmlspecialchars((string)$domainScan['grade']) ?></span></td>
-                    <td><strong><?= number_format((int)$domainScan['score']) ?></strong></td>
+                    <td>
+                      <strong><?= (string)$domainScan['grade'] === 'N/A' ? 'Tidak dinilai' : number_format((int)$domainScan['score']) ?></strong>
+                      <?php if ((string)$domainScan['grade'] === 'N/A' && !empty($domainScan['assessment_reason'])): ?>
+                        <div class="target-url"><?= htmlspecialchars((string)$domainScan['assessment_reason']) ?></div>
+                      <?php endif; ?>
+                    </td>
                     <td><?= htmlspecialchars(!empty($domainScan['client_country']) ? countryLabel((string)$domainScan['client_country']) : '-') ?></td>
                     <td><?= htmlspecialchars(relTime((string)$domainScan['scanned_at'])) ?></td>
                     <td><a class="rescan-link" href="<?= htmlspecialchars($rescanUrl) ?>">Rescan</a></td>
@@ -1454,7 +1739,7 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
           <?php endif; ?>
         </article>
 
-        <article class="panel">
+        <article class="panel" data-dashboard-tabs="activity" hidden>
           <div class="panel-head">
             <div>
               <h2 class="panel-title">Recent Authorized Scans</h2>
@@ -1484,7 +1769,10 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
                   $rescanUrl = 'index.php?url=' . rawurlencode($targetUrl) . '&rescan=1';
                   $statusText = 'Clear';
                   $statusTone = 'good';
-                  if ((int)($s['scan_blocked'] ?? 0) === 1) {
+                  if ((string)($s['grade'] ?? '') === 'N/A') {
+                      $statusText = 'Tidak dinilai';
+                      $statusTone = 'info';
+                  } elseif ((int)($s['scan_blocked'] ?? 0) === 1) {
                       $statusText = 'Blocked';
                       $statusTone = 'warn';
                   } elseif ((int)$s['critical'] > 0) {
@@ -1529,7 +1817,12 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
                   <td><?= htmlspecialchars($cmsText) ?></td>
                   <td><span class="pill <?= $wafTone ?>"><?= htmlspecialchars($wafText) ?></span></td>
                   <td><span class="pill <?= $gradeClass ?>"><?= htmlspecialchars($s['grade']) ?></span></td>
-                  <td><span class="pill <?= $statusTone ?>"><?= htmlspecialchars($statusText) ?></span></td>
+                  <td>
+                    <span class="pill <?= $statusTone ?>"><?= htmlspecialchars($statusText) ?></span>
+                    <?php if ((string)($s['grade'] ?? '') === 'N/A' && !empty($s['assessment_reason'])): ?>
+                      <div class="target-url"><?= htmlspecialchars((string)$s['assessment_reason']) ?></div>
+                    <?php endif; ?>
+                  </td>
                   <td><?= htmlspecialchars(relTime($s['scanned_at'])) ?></td>
                   <td>
                     <div class="row-actions">
@@ -1560,7 +1853,7 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
       </section>
 
       <aside class="stack">
-        <article class="panel">
+        <article class="panel" data-dashboard-tabs="operations" hidden>
           <div class="panel-head">
             <div>
               <h2 class="panel-title">CDN / Edge Coverage</h2>
@@ -1576,7 +1869,7 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
               <div class="cdn-row">
                 <div class="cdn-domain">
                   <strong><?= htmlspecialchars($cdn['hostname']) ?></strong>
-                  <span><?= number_format((int)$cdn['scan_count']) ?> scan · skor purata <?= htmlspecialchars((string)$cdn['avg_score']) ?></span>
+                  <span><?= number_format((int)$cdn['scan_count']) ?> scan · skor purata <?= $cdn['avg_score'] === null ? 'N/A' : htmlspecialchars((string)$cdn['avg_score']) ?></span>
                 </div>
                 <div class="cdn-provider">
                   <span class="cdn-dot" aria-hidden="true"></span>
@@ -1590,7 +1883,7 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
           </div>
         </article>
 
-        <article class="panel">
+        <article class="panel" data-dashboard-tabs="overview operations">
           <div class="panel-head">
             <div>
               <h2 class="panel-title">Action Queue</h2>
@@ -1641,7 +1934,7 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
           </div>
         </article>
 
-        <article class="panel">
+        <article class="panel" data-dashboard-tabs="operations" hidden>
           <div class="panel-head">
             <div>
               <h2 class="panel-title">Compliance Readiness</h2>
@@ -1660,6 +1953,12 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
         </article>
       </aside>
     </div>
+    </div>
+    <section class="panel" style="margin-top:16px" id="contact-messages">
+      <div class="panel-head"><div><h2 class="panel-title">Mesej Contact Us</h2><p class="panel-sub">Mesej disulitkan semasa disimpan dan dinyahenkripsi hanya dalam sesi dashboard pentadbir.</p></div><span class="pill info"><?= number_format(count($contactMessages)) ?> mesej</span></div>
+      <?php if ($contactMessageNotice): ?><p class="contact-notice <?= htmlspecialchars($contactMessageTone) ?>" style="margin:12px 14px"><?= htmlspecialchars($contactMessageNotice) ?></p><?php endif; ?>
+      <?php if ($contactMessages): ?><form method="post" class="contact-delete-form" id="contactDeleteForm"><input type="hidden" name="csrf_token" value="<?= htmlspecialchars((string)$_SESSION['csrf_token'], ENT_QUOTES) ?>"><input type="hidden" name="contact_delete" value="1"><div class="table-wrap"><table class="enterprise-table"><thead><tr><th><input class="contact-select" id="contactSelectAll" type="checkbox" aria-label="Pilih semua mesej"></th><th>Masa</th><th>Pengirim</th><th>Subjek</th><th>Mesej</th><th>Notifikasi e-mel</th></tr></thead><tbody><?php foreach ($contactMessages as $contact): ?><tr><td><input class="contact-select contact-select-item" type="checkbox" name="contact_ids[]" value="<?= (int)$contact['id'] ?>" aria-label="Pilih mesej <?= (int)$contact['id'] ?>"></td><td><?= htmlspecialchars(relTime((string)$contact['received_at'])) ?></td><td><strong><?= htmlspecialchars((string)$contact['name']) ?></strong><div class="target-url"><?= htmlspecialchars((string)$contact['email']) ?></div></td><td><?= htmlspecialchars((string)$contact['subject']) ?></td><td style="white-space:normal;min-width:280px"><?= nl2br(htmlspecialchars((string)$contact['message'])) ?></td><td><span class="pill <?= !empty($contact['mail_sent']) ? 'good' : 'info' ?>"><?= !empty($contact['mail_sent']) ? 'Dihantar' : 'Dashboard' ?></span></td></tr><?php endforeach; ?></tbody></table></div><div class="contact-delete-actions"><span class="contact-delete-note">Padam adalah kekal dan tidak boleh dipulihkan.</span><button class="btn-danger" type="submit">Padam mesej dipilih</button></div></form><?php else: ?><div class="empty-state">Belum ada mesej Contact Us atau kunci penyulitan belum dikonfigurasi.</div><?php endif; ?>
+    </section>
   </main>
 </div>
 
@@ -1776,6 +2075,65 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
 })();
 
 (function () {
+  var tabButtons = Array.from(document.querySelectorAll('[data-dashboard-tab-button]'));
+  var tabSections = Array.from(document.querySelectorAll('[data-dashboard-tabs]'));
+  var grid = document.querySelector('.dash-grid');
+  var view = document.getElementById('dashboard-view');
+  if (!tabButtons.length || !tabSections.length || !grid || !view) return;
+
+  var storageKey = 'secscan-dashboard-section';
+  function isKnownTab(tab) {
+    return tabButtons.some(function (button) { return button.getAttribute('data-dashboard-tab-button') === tab; });
+  }
+  function tabForRequest() {
+    var params = new URLSearchParams(window.location.search);
+    if (window.location.hash === '#domain-grade-list' || params.has('domain_grade') || params.has('domain_sort') || params.has('domains_p')) return 'inventory';
+    if (params.has('p')) return 'activity';
+    try {
+      var saved = localStorage.getItem(storageKey);
+      if (isKnownTab(saved)) return saved;
+    } catch (_) {}
+    return 'overview';
+  }
+  function activate(tab, persist) {
+    if (!isKnownTab(tab)) tab = 'overview';
+    tabSections.forEach(function (section) {
+      var tabs = (section.getAttribute('data-dashboard-tabs') || '').split(/\s+/);
+      section.hidden = tabs.indexOf(tab) === -1;
+    });
+    tabButtons.forEach(function (button) {
+      var active = button.getAttribute('data-dashboard-tab-button') === tab;
+      button.setAttribute('aria-selected', active ? 'true' : 'false');
+      button.setAttribute('tabindex', active ? '0' : '-1');
+    });
+    grid.classList.toggle('is-single-column', tab !== 'overview' && tab !== 'operations');
+    grid.classList.toggle('is-operations', tab === 'operations');
+    view.setAttribute('aria-labelledby', 'dashboard-tab-' + tab);
+    if (persist) {
+      try { localStorage.setItem(storageKey, tab); } catch (_) {}
+    }
+    document.dispatchEvent(new CustomEvent('secscan:dashboard-tab', { detail: { tab: tab } }));
+  }
+  activate(tabForRequest(), false);
+  tabButtons.forEach(function (button, index) {
+    button.addEventListener('click', function () {
+      activate(button.getAttribute('data-dashboard-tab-button'), true);
+    });
+    button.addEventListener('keydown', function (event) {
+      var next = null;
+      if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (index + 1) % tabButtons.length;
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (index - 1 + tabButtons.length) % tabButtons.length;
+      if (event.key === 'Home') next = 0;
+      if (event.key === 'End') next = tabButtons.length - 1;
+      if (next === null) return;
+      event.preventDefault();
+      tabButtons[next].focus();
+      activate(tabButtons[next].getAttribute('data-dashboard-tab-button'), true);
+    });
+  });
+})();
+
+(function () {
   var form = document.getElementById('geoIpUpdateForm');
   var button = document.getElementById('geoIpUpdateBtn');
   if (!form || !button) return;
@@ -1824,32 +2182,40 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
       rows.forEach(function (row) {
         var code = String(row.country || '').toUpperCase();
         var count = Number(row.cnt || 0);
-        var score = Number(row.avg_score || 0);
+        var rowGrade = String(row.grade || '');
+        var score = row.avg_score === null || row.avg_score === '' ? null : Number(row.avg_score);
+        var assessed = rowGrade !== 'N/A' && score !== null && Number.isFinite(score);
         if (!/^[A-Z]{2}$/.test(code) || count < 1) return;
         totals[code] = (totals[code] || 0) + count;
-        if (grade !== 'all' && String(row.grade || '') !== grade) return;
-        if (!grouped[code]) grouped[code] = { country: code, cnt: 0, scoreTotal: 0 };
+        if (grade !== 'all' && rowGrade !== grade) return;
+        if (!grouped[code]) grouped[code] = { country: code, cnt: 0, scoreTotal: 0, scoredCount: 0 };
         grouped[code].cnt += count;
-        grouped[code].scoreTotal += score * count;
+        if (assessed) {
+          grouped[code].scoreTotal += score * count;
+          grouped[code].scoredCount += count;
+        }
       });
       return Object.keys(grouped).map(function (code) {
         var item = grouped[code];
-        item.avg = item.cnt ? item.scoreTotal / item.cnt : 0;
+        item.avg = item.scoredCount ? item.scoreTotal / item.scoredCount : null;
         item.total = totals[code] || item.cnt;
         return item;
       });
     }
+    var mapInitialized = false;
     function render() {
       var metric = metricFilter.value;
       var countries = aggregate();
       var values = {};
       countries.forEach(function (item) {
-        values[item.country] = metric === 'count' ? item.cnt : (metric === 'best' ? item.avg : 100 - item.avg);
+        values[item.country] = metric === 'count' || item.avg === null
+          ? item.cnt
+          : (metric === 'best' ? item.avg : 100 - item.avg);
       });
       var sort = metric === 'worst'
-        ? function (a, b) { return a.avg - b.avg; }
+        ? function (a, b) { return (a.avg === null ? 101 : a.avg) - (b.avg === null ? 101 : b.avg); }
         : metric === 'best'
-          ? function (a, b) { return b.avg - a.avg; }
+          ? function (a, b) { return (b.avg === null ? -1 : b.avg) - (a.avg === null ? -1 : a.avg); }
           : function (a, b) { return b.cnt - a.cnt; };
       countries.sort(sort);
       if (list) {
@@ -1857,8 +2223,9 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
           var gradeText = gradeFilter.value === 'all'
             ? 'Semua: ' + item.total + ' domain'
             : gradeFilter.value + ': ' + item.cnt + ' / ' + item.total + ' domain';
+          var scoreText = item.avg === null ? 'N/A' : item.avg.toFixed(1);
           return '<div class="geoip-country"><div><strong>' + escapeHtml(nameFor(item.country)) + '</strong><br><span>'
-            + escapeHtml(item.country) + ' · ' + gradeText + ' · skor ' + item.avg.toFixed(1) + '</span></div><strong>' + item.cnt + '</strong></div>';
+            + escapeHtml(item.country) + ' · ' + gradeText + ' · skor ' + scoreText + '</span></div><strong>' + item.cnt + '</strong></div>';
         }).join('') || '<div class="empty-state">Tiada rekod untuk penapis ini.</div>';
       }
       target.innerHTML = '';
@@ -1870,16 +2237,29 @@ tr:hover td { background: color-mix(in srgb, var(--elevated) 76%, transparent); 
         onRegionTooltipShow: function (event, tooltip, code) {
           var item = countries.find(function (country) { return country.country === code; });
           var label = gradeFilter.value === 'all' ? 'Semua' : gradeFilter.value;
-          tooltip.text(tooltip.text() + (item ? ' · ' + label + ': ' + item.cnt + ' / ' + item.total + ' domain · skor ' + item.avg.toFixed(1) : ' · tiada domain'));
+          var scoreText = item && item.avg !== null ? item.avg.toFixed(1) : 'N/A';
+          tooltip.text(tooltip.text() + (item ? ' · ' + label + ': ' + item.cnt + ' / ' + item.total + ' domain · skor ' + scoreText : ' · tiada domain'));
         }
       });
+      mapInitialized = true;
     }
     gradeFilter.addEventListener('change', function () { try { localStorage.setItem('secscan-geo-grade', gradeFilter.value); } catch (_) {} render(); });
     metricFilter.addEventListener('change', function () { try { localStorage.setItem('secscan-geo-metric', metricFilter.value); } catch (_) {} render(); });
-    render();
+    document.addEventListener('secscan:dashboard-tab', function (event) {
+      if (event.detail && event.detail.tab === 'inventory' && !mapInitialized) render();
+    });
+    if (!target.closest('[hidden]')) render();
   } catch (err) {
     target.innerHTML = '<div class="empty-state">Peta tidak dapat dimuatkan. Jadual negara masih tersedia.</div>';
   }
+})();
+
+(function () {
+  var all = document.getElementById('contactSelectAll');
+  if (!all) return;
+  var items = Array.prototype.slice.call(document.querySelectorAll('.contact-select-item'));
+  all.addEventListener('change', function () { items.forEach(function (item) { item.checked = all.checked; }); });
+  items.forEach(function (item) { item.addEventListener('change', function () { all.checked = items.length > 0 && items.every(function (checkbox) { return checkbox.checked; }); }); });
 })();
 
 </script>

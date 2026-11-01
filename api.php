@@ -4,6 +4,7 @@ require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/src/RateLimiter.php';
 require_once __DIR__ . '/src/UrlGuard.php';
 
+header_remove('X-Powered-By');
 set_time_limit(120);
 ini_set('max_execution_time', '120');
 ob_start();
@@ -30,11 +31,13 @@ header('Expires: 0');
 secscan_send_operational_security_headers();
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(200);
+    header('Allow: GET, POST, OPTIONS');
+    http_response_code(204);
     exit;
 }
 
 if (!in_array($_SERVER['REQUEST_METHOD'], ['GET', 'POST'], true)) {
+    header('Allow: GET, POST, OPTIONS');
     $sendJson(['error' => 'Method not allowed.'], 405);
 }
 
@@ -42,7 +45,13 @@ $rawBody = $_SERVER['REQUEST_METHOD'] === 'POST' ? secscan_read_request_body() :
 if ($rawBody === null) {
     $sendJson(['error' => 'Request body is too large.'], 413);
 }
-$input = $rawBody !== '' ? (json_decode($rawBody, true) ?: []) : [];
+$input = $rawBody !== '' ? json_decode($rawBody, true) : [];
+if (!is_array($input) || ($rawBody !== '' && json_last_error() !== JSON_ERROR_NONE)) {
+    if ($_POST === []) {
+        $sendJson(['error' => 'Invalid JSON request.'], 400);
+    }
+    $input = [];
+}
 $urlInput = trim((string)($input['url'] ?? $_POST['url'] ?? $_GET['url'] ?? ''));
 
 $target = UrlGuard::normalizeAndValidate($urlInput);
@@ -79,26 +88,39 @@ if (!$rate['allowed']) {
     ], 429);
 }
 
-require_once __DIR__ . '/scanner.php';
-
 try {
-    $scanner = new SecurityScanner($target['url']);
-
     // Authenticated scanning (opt-in via SECSCAN_ALLOW_AUTH_SCAN=1). Accepts a
     // raw Cookie value and/or a header map so scans can run behind a login.
+    $authCookie = '';
+    $authHeaders = [];
     if (secscan_config('allow_auth_scan')) {
-        $authCookie  = trim((string)($input['auth_cookie'] ?? ''));
+        $authCookie = trim((string)($input['auth_cookie'] ?? ''));
         $authHeaders = $input['auth_headers'] ?? [];
         if (!is_array($authHeaders)) $authHeaders = [];
         if ($authCookie !== '' || $authHeaders !== []) {
             if (($target['scheme'] ?? '') !== 'https') {
                 $sendJson(['error' => 'Authenticated scanning requires a valid HTTPS URL.'], 400);
             }
-            $scanner->setAuth($authHeaders, $authCookie);
         }
     }
 
-    $result = $scanner->scan();
+    if (secscan_config('scanner_mode') === 'remote') {
+        require_once __DIR__ . '/src/RemoteScannerClient.php';
+        $client = new RemoteScannerClient(
+            (string)secscan_config('worker_url'),
+            (string)secscan_config('worker_shared_secret'),
+            (int)secscan_config('worker_timeout'),
+            (int)secscan_config('worker_max_response_bytes')
+        );
+        $result = $client->scan((string)$target['url'], $authHeaders, $authCookie);
+    } else {
+        require_once __DIR__ . '/scanner.php';
+        $scanner = new SecurityScanner((string)$target['url']);
+        if ($authCookie !== '' || $authHeaders !== []) {
+            $scanner->setAuth($authHeaders, $authCookie);
+        }
+        $result = $scanner->scan();
+    }
 
     try {
         $loggerPath = __DIR__ . '/logger.php';

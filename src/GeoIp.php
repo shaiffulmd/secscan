@@ -9,6 +9,8 @@
 final class GeoIp
 {
     private const DBIP_DOWNLOAD_HOST = 'download.db-ip.com';
+    private const MAX_IMPORT_RECORDS = 5000000;
+    private const MAX_CSV_LINE_BYTES = 4096;
 
     public static function lookup(PDO $pdo, string $ip): string
     {
@@ -77,6 +79,7 @@ final class GeoIp
         if ($tmp === false) {
             return ['ok' => false, 'message' => 'Tidak dapat menyediakan fail sementara GeoIP.', 'records' => 0, 'backfilled' => 0];
         }
+        @chmod($tmp, 0600);
 
         try {
             $out = fopen($tmp, 'wb');
@@ -135,13 +138,19 @@ final class GeoIp
             $insert = $pdo->prepare('INSERT INTO geoip_country_next (family, ip_start, ip_end, country, updated_at) VALUES (?, ?, ?, ?, ?)');
             $updatedAt = gmdate('Y-m-d\\TH:i:s\\Z');
             $records = 0;
-            while (($line = gzgets($gz)) !== false) {
+            while (($line = gzgets($gz, self::MAX_CSV_LINE_BYTES)) !== false) {
+                if (!str_ends_with($line, "\n") && !gzeof($gz)) {
+                    throw new RuntimeException('Baris CSV GeoIP melebihi had yang dibenarkan.');
+                }
                 $row = str_getcsv(trim($line));
                 if (count($row) < 3) continue;
                 $start = @inet_pton(trim((string)$row[0], '"'));
                 $end = @inet_pton(trim((string)$row[1], '"'));
                 $country = strtoupper(trim((string)$row[2], '"'));
                 if ($start === false || $end === false || strlen($start) !== strlen($end) || !preg_match('/^[A-Z]{2}$/', $country)) continue;
+                if ($records >= self::MAX_IMPORT_RECORDS) {
+                    throw new RuntimeException('Import GeoIP melebihi had rekod yang dibenarkan.');
+                }
                 $insert->bindValue(1, strlen($start) === 4 ? 4 : 6, PDO::PARAM_INT);
                 $insert->bindValue(2, $start, PDO::PARAM_LOB);
                 $insert->bindValue(3, $end, PDO::PARAM_LOB);

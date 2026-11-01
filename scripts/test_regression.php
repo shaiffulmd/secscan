@@ -43,6 +43,28 @@ $assertSame('', GeoIp::lookup($geoPdo, '8.8.9.1'), 'GeoIP should not resolve an 
 $scanner = new SecurityScanner('https://8.8.8.8');
 $ref = new ReflectionClass(SecurityScanner::class);
 
+$frameScanner = new SecurityScanner('https://8.8.8.8');
+$ref->getProperty('responseHeaders')->setValue($frameScanner, [
+    'content-security-policy' => ["default-src 'self'; frame-ancestors 'none'"],
+]);
+$ref->getMethod('checkXFrameOptions')->invoke($frameScanner);
+$frameFindings = $ref->getProperty('findings')->getValue($frameScanner);
+$assert(
+    count(array_filter($frameFindings, fn($f) => $f->check === 'Clickjacking Protection' && $f->severity === 'pass')) === 1,
+    'CSP frame-ancestors should satisfy clickjacking protection when X-Frame-Options is absent.'
+);
+
+$invalidFrameScanner = new SecurityScanner('https://8.8.8.8');
+$ref->getProperty('responseHeaders')->setValue($invalidFrameScanner, [
+    'x-frame-options' => ['ALLOWALL'],
+]);
+$ref->getMethod('checkXFrameOptions')->invoke($invalidFrameScanner);
+$invalidFrameFindings = $ref->getProperty('findings')->getValue($invalidFrameScanner);
+$assert(
+    count(array_filter($invalidFrameFindings, fn($f) => $f->check === 'X-Frame-Options' && $f->severity === 'warning')) === 1,
+    'Invalid X-Frame-Options should remain a warning without CSP frame-ancestors.'
+);
+
 $cmsFindingFor = static function (string $body, array $headers = []) use ($ref): ?SecurityFinding {
     $scanner = new SecurityScanner('https://8.8.8.8');
     $responseBody = $ref->getProperty('responseBody');
@@ -143,6 +165,9 @@ $challengeResult = $ref->getMethod('buildResult')->invoke($challengeScanner);
 $challengeTech = $challengeResult['categories']['Technology'] ?? [];
 $assertSame(true, $challengeResult['scan_blocked'] ?? null, 'Captcha/validation pages should set scan_blocked=true.');
 $assertSame('captcha_validation', $challengeResult['scan_blocked_type'] ?? null, 'Captcha/validation pages should expose the blocked type.');
+$assertSame('unavailable', $challengeResult['assessment_status'] ?? null, 'Captcha/validation pages should be explicitly unassessed.');
+$assertSame(null, $challengeResult['score'] ?? null, 'Captcha/validation pages should not receive a numeric security score.');
+$assertSame('N/A', $challengeResult['grade'] ?? null, 'Captcha/validation pages should not receive a misleading F grade.');
 $assert(
     (bool)array_filter($challengeTech, fn($f) => ($f['check'] ?? '') === 'CMS Detection Blocked'),
     'Captcha/validation pages should be reported as blocked CMS detection.'
@@ -234,9 +259,125 @@ $findingsProp->setValue($scanner, [
 $score = $calculateScore->invoke($scanner);
 $assert(($score['score'] ?? 100) < 100, 'Scoreable warnings should still reduce the score.');
 
+$failedScanner = new SecurityScanner('https://8.8.8.8');
+$findingsProp->setValue($failedScanner, [
+    new SecurityFinding('Connection', 'Reachability', 'critical', 'Could not connect: timed out.'),
+]);
+$failedResult = $ref->getMethod('buildResult')->invoke($failedScanner);
+$assertSame('unavailable', $failedResult['assessment_status'] ?? null, 'A failed connection should be marked unassessed.');
+$assertSame(null, $failedResult['score'] ?? null, 'A failed connection should not be represented as score zero.');
+$assertSame('N/A', $failedResult['grade'] ?? null, 'A failed connection should not be represented as grade F.');
+$assertSame('Could not connect: timed out.', $failedResult['assessment_reason'] ?? null, 'The unassessed result should expose the concrete failure reason.');
+
+$httpErrorScanner = new SecurityScanner('https://8.8.8.8');
+$findingsProp->setValue($httpErrorScanner, [
+    new SecurityFinding('Connection', 'Reachability', 'pass', 'Connected to an error page.'),
+]);
+$ref->getProperty('httpCode')->setValue($httpErrorScanner, 403);
+$httpErrorResult = $ref->getMethod('buildResult')->invoke($httpErrorScanner);
+$assertSame('unavailable', $httpErrorResult['assessment_status'] ?? null, 'HTTP error pages should not be treated as complete scans.');
+$assertSame('N/A', $httpErrorResult['grade'] ?? null, 'HTTP error pages should not receive a security grade.');
+$assert(str_contains((string)($httpErrorResult['assessment_reason'] ?? ''), 'HTTP 403'), 'HTTP error assessment reason should include the response status.');
+
 $mapSeverity = $ref->getMethod('mapCveSeverity');
 $assertSame('critical', $mapSeverity->invoke($scanner, 'HIGH'), 'High CVEs should map to critical findings.');
 $assertSame('warning', $mapSeverity->invoke($scanner, 'MEDIUM'), 'Medium CVEs should map to warning findings.');
+
+$wp2shell = $ref->getMethod('wp2shellAdvisoryForVersion');
+$assertSame('not_affected', $wp2shell->invoke($scanner, '6.7.9')['status'] ?? null, 'WordPress before 6.8 should not be affected by wp2shell.');
+$assertSame('sql_injection_only', $wp2shell->invoke($scanner, '6.8')['status'] ?? null, 'WordPress 6.8 should be flagged for the SQL injection component.');
+$assertSame('patched_or_not_affected', $wp2shell->invoke($scanner, '6.8.6')['status'] ?? null, 'WordPress 6.8.6 should be treated as patched for the SQL injection component.');
+$assertSame('rce_chain', $wp2shell->invoke($scanner, '6.9')['status'] ?? null, 'WordPress 6.9 should be flagged for the full wp2shell RCE chain.');
+$assertSame('patched_or_not_affected', $wp2shell->invoke($scanner, '6.9.5')['status'] ?? null, 'WordPress 6.9.5 should be treated as patched for wp2shell.');
+$assertSame('rce_chain', $wp2shell->invoke($scanner, '7.0.1')['status'] ?? null, 'WordPress 7.0.1 should be flagged for the full wp2shell RCE chain.');
+$assertSame('patched_or_not_affected', $wp2shell->invoke($scanner, '7.0.2')['status'] ?? null, 'WordPress 7.0.2 should be treated as patched for wp2shell.');
+$assertSame('rce_chain', $wp2shell->invoke($scanner, '7.1-beta1')['status'] ?? null, 'WordPress 7.1 beta1 should be flagged for wp2shell.');
+
+$wpCoreScanner = new SecurityScanner('https://8.8.8.8');
+$ref->getProperty('detectedCms')->setValue($wpCoreScanner, 'WordPress');
+$ref->getProperty('detectedCmsVersion')->setValue($wpCoreScanner, '7.0.1');
+$ref->getMethod('checkWordPressCoreAdvisories')->invoke($wpCoreScanner);
+$wpCoreResult = $ref->getMethod('buildResult')->invoke($wpCoreScanner);
+$wpCoreFindings = $wpCoreResult['categories']['Technology'] ?? [];
+$wp2shellFindings = array_values(array_filter($wpCoreFindings, fn($f) => ($f['check'] ?? '') === 'WordPress Core Advisory: wp2shell'));
+$assert(count($wp2shellFindings) === 1, 'WordPress core advisory check should add a wp2shell finding.');
+$assertSame('critical', $wp2shellFindings[0]['severity'] ?? null, 'Affected WordPress versions should produce a critical wp2shell finding.');
+$assert(str_contains((string)($wp2shellFindings[0]['message'] ?? ''), 'CVE-2026-63030'), 'wp2shell finding should cite the RCE CVE.');
+
+$wpUnknownScanner = new SecurityScanner('https://8.8.8.8');
+$ref->getProperty('detectedCms')->setValue($wpUnknownScanner, 'WordPress');
+$ref->getProperty('detectedCmsVersion')->setValue($wpUnknownScanner, '');
+$ref->getMethod('checkWordPressCoreAdvisories')->invoke($wpUnknownScanner);
+$wpUnknownResult = $ref->getMethod('buildResult')->invoke($wpUnknownScanner);
+$wpUnknownFindings = array_values(array_filter($wpUnknownResult['categories']['Technology'] ?? [], fn($f) => ($f['check'] ?? '') === 'WordPress Core Advisory: wp2shell'));
+$assertSame(false, $wpUnknownFindings[0]['scoreable'] ?? true, 'Unknown WordPress version wp2shell advisory should be non-scoreable.');
+
+$coreFindings = function (string $cms, string $version, array $extensions = []) use ($ref): array {
+    $instance = new SecurityScanner('https://8.8.8.8');
+    $ref->getProperty('detectedCms')->setValue($instance, $cms);
+    $ref->getProperty('detectedCmsVersion')->setValue($instance, $version);
+    $ref->getProperty('installedExtensions')->setValue($instance, $extensions);
+    $ref->getMethod('checkCMSCoreAdvisories')->invoke($instance);
+    return $ref->getMethod('buildResult')->invoke($instance)['categories']['Technology'] ?? [];
+};
+
+$wpAffected = array_column($coreFindings('WordPress', '7.1.1'), null, 'check');
+$assertSame('critical', $wpAffected['WordPress Core Advisory: CVE-2026-87902']['severity'] ?? null, 'WordPress 7.1.1 should get a critical CVE-2026-87902 finding.');
+$assert(str_contains((string)($wpAffected['WordPress Core Advisory: CVE-2026-87902']['message'] ?? ''), 'CISA KEV'), 'CVE-2026-87902 finding should say it is in CISA KEV.');
+$assert(str_contains((string)($wpAffected['WordPress Core Advisory: CVE-2026-87902']['recommendation'] ?? ''), '7.1.2'), 'CVE-2026-87902 finding should recommend the branch fix.');
+$assertSame('pass', $coreFindings('WordPress', '7.1.4')[0]['severity'] ?? null, 'WordPress 7.1.4 should pass the core advisories.');
+
+$drupalBranchOnly = $coreFindings('Drupal', '11')[0] ?? [];
+$assertSame('info', $drupalBranchOnly['severity'] ?? null, 'A major-only Drupal version should stay informational.');
+$assertSame(false, $drupalBranchOnly['scoreable'] ?? true, 'A major-only Drupal version must not lower the grade.');
+
+$jce = array_column($coreFindings('Joomla', '6.1.4', ['com_jce' => 'jce']), null, 'check');
+$assertSame('warning', $jce['Joomla Extension: JCE editor']['severity'] ?? null, 'A fingerprinted JCE install should get a KEV warning.');
+$assertSame('pass', $jce['Joomla Core Advisories']['severity'] ?? null, 'Patched Joomla core should still pass alongside the extension warning.');
+
+$magento = new SecurityScanner('https://8.8.8.8');
+$ref->getProperty('responseBody')->setValue($magento, '<html><script type="text/x-magento-init">{}</script></html>');
+$ref->getMethod('checkCMSDetection')->invoke($magento);
+$assertSame('Magento', $ref->getProperty('detectedCms')->getValue($magento), 'Magento init scripts should fingerprint the CMS.');
+
+$stack = new SecurityScanner('https://8.8.8.8');
+$ref->getProperty('responseHeaders')->setValue($stack, ['x-powered-by' => ['PHP/8.3.1'], 'server' => ['nginx/1.28.0']]);
+$ref->getMethod('checkOutdatedSoftware')->invoke($stack);
+$stackFindings = array_column($ref->getMethod('buildResult')->invoke($stack)['categories']['Technology'] ?? [], null, 'check');
+$assertSame('critical', $stackFindings['PHP2Shell Exposure']['severity'] ?? null, 'Unpatched PHP 8.3 should get a critical PHP2Shell finding.');
+$assertSame('warning', $stackFindings['Outdated nginx']['severity'] ?? null, 'nginx 1.28 should now be flagged as outdated.');
+$assert(!isset($stackFindings['Software Currency']), 'The all-clear finding must not appear beside real version findings.');
+
+$mtaStsAdvice = new SecurityScanner('https://8.8.8.8');
+$ref->getProperty('hostname')->setValue($mtaStsAdvice, 'no-such-domain.invalid');
+$ref->getMethod('checkMTASTS')->invoke($mtaStsAdvice);
+$mtaStsFinding = array_column($ref->getMethod('buildResult')->invoke($mtaStsAdvice)['categories']['DNS'] ?? [], null, 'check')['MTA-STS'] ?? [];
+$mtaStsRecommendation = (string)($mtaStsFinding['recommendation'] ?? '');
+$assert(preg_match('/id=\d{8}"/', $mtaStsRecommendation) === 1, 'The MTA-STS example record should carry a literal date id.');
+$assert(!str_contains($mtaStsRecommendation, '$('), 'The MTA-STS example record must not contain shell syntax that users would copy into DNS.');
+
+$kevScan = new SecurityScanner('https://8.8.8.8');
+$ref->getProperty('responseHeaders')->setValue($kevScan, ['server' => ['ScreenConnect/25.1']]);
+$ref->getMethod('checkKnownExploitedTech')->invoke($kevScan);
+$kevFinding = array_column($ref->getMethod('buildResult')->invoke($kevScan)['categories']['Technology'] ?? [], null, 'check')['Known-exploited product: ConnectWise ScreenConnect'] ?? [];
+$assertSame('info', $kevFinding['severity'] ?? null, 'A fingerprinted KEV product should be reported as info.');
+$assertSame(false, $kevFinding['scoreable'] ?? true, 'A fingerprinted KEV product must not lower the grade.');
+
+$refine = new SecurityScanner('https://8.8.8.8');
+$ref->getProperty('detectedCmsVersion')->setValue($refine, '11');
+$ref->getMethod('refineCmsVersion')->invoke($refine, '11.3.19');
+$assertSame('11.3.19', $ref->getProperty('detectedCmsVersion')->getValue($refine), 'A fuller version should replace a major-only one.');
+$ref->getMethod('refineCmsVersion')->invoke($refine, '11');
+$assertSame('11.3.19', $ref->getProperty('detectedCmsVersion')->getValue($refine), 'A shorter version must not overwrite a fuller one.');
+
+$latestCachePath = sys_get_temp_dir() . '/secscan-cve-latest-test-' . bin2hex(random_bytes(4)) . '.json';
+file_put_contents($latestCachePath, '{"cached":"latest"}');
+$latestBody = $ref->getMethod('fetchLatestCveFeed')->invoke($scanner, 'https://127.0.0.1:9/not-used?x=1', $latestCachePath, 86400);
+$assertSame('{"cached":"latest"}', $latestBody, 'A fresh latest-CVE cache should avoid both NVD requests.');
+touch($latestCachePath, time() - 172800);
+$staleBody = $ref->getMethod('fetchLatestCveFeed')->invoke($scanner, 'https://127.0.0.1:9/not-used?x=1', $latestCachePath, 86400);
+@unlink($latestCachePath);
+$assertSame('{"cached":"latest"}', $staleBody, 'A stale cache should be used when the NVD count request fails.');
 
 $cachePath = sys_get_temp_dir() . '/secscan-cve-cache-test-' . bin2hex(random_bytes(4)) . '.json';
 file_put_contents($cachePath, '{"cached":true}');

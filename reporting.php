@@ -72,19 +72,23 @@ if ($dataDir !== '' && (is_dir($dataDir) || @mkdir($dataDir, 0750, true))) {
         $path = rtrim($dataDir, '/\\') . '/security-reports.ndjson';
         $fp = @fopen($path, 'c+');
         if ($fp !== false) {
-            flock($fp, LOCK_EX);
-            $size = (int)(fstat($fp)['size'] ?? 0);
-            $entry = $line . "\n";
-            // A bounded circular log prevents unauthenticated reports from
-            // exhausting disk. Export it externally if longer retention is needed.
-            if ($size + strlen($entry) > (int)secscan_config('report_log_max_bytes')) {
-                ftruncate($fp, 0);
-                rewind($fp);
+            @chmod($path, 0600);
+            if (flock($fp, LOCK_EX)) {
+                $size = (int)(fstat($fp)['size'] ?? 0);
+                $entry = $line . "\n";
+                // A bounded circular log prevents unauthenticated reports from
+                // exhausting disk. Export it externally if longer retention is needed.
+                $positioned = $size + strlen($entry) > (int)secscan_config('report_log_max_bytes')
+                    ? ftruncate($fp, 0) && rewind($fp)
+                    : fseek($fp, 0, SEEK_END) === 0;
+                $written = $positioned ? fwrite($fp, $entry) : false;
+                if ($written !== strlen($entry) || !fflush($fp)) {
+                    error_log('[SecScan Reporting] Security report could not be persisted.');
+                }
+                flock($fp, LOCK_UN);
             } else {
-                fseek($fp, 0, SEEK_END);
+                error_log('[SecScan Reporting] Security report log could not be locked.');
             }
-            fwrite($fp, $entry);
-            flock($fp, LOCK_UN);
             fclose($fp);
         }
     }

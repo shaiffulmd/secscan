@@ -134,10 +134,23 @@ function secscan_config(?string $key = null)
             'scan_rate_limit' => (int)secscan_env('SECSCAN_SCAN_RATE_LIMIT', '50'),
             'scan_rate_window' => (int)secscan_env('SECSCAN_SCAN_RATE_WINDOW', '86400'),
             'max_request_bytes' => max(1024, (int)secscan_env('SECSCAN_MAX_REQUEST_BYTES', '65536')),
+            // Bound memory used for untrusted target responses. The main page
+            // keeps enough HTML for fingerprinting while auxiliary probes need
+            // only a small signature sample.
+            'target_max_response_bytes' => max(262144, min(16777216, (int)secscan_env('SECSCAN_TARGET_MAX_RESPONSE_BYTES', '2097152'))),
+            'probe_max_response_bytes' => max(32768, min(1048576, (int)secscan_env('SECSCAN_PROBE_MAX_RESPONSE_BYTES', '262144'))),
             'rate_limit_max_keys' => max(100, (int)secscan_env('SECSCAN_RATE_LIMIT_MAX_KEYS', '10000')),
             'report_rate_limit' => max(1, (int)secscan_env('SECSCAN_REPORT_RATE_LIMIT', '30')),
             'report_rate_window' => max(1, (int)secscan_env('SECSCAN_REPORT_RATE_WINDOW', '60')),
             'report_log_max_bytes' => max(65536, (int)secscan_env('SECSCAN_REPORT_LOG_MAX_BYTES', '5242880')),
+            // TLS probe time budget (seconds). One scan opens many ssl:// handshakes;
+            // these cap per-probe and total TLS time so a slow, rate-limiting, or
+            // filtered host cannot stall the whole scan. phase_budget is the total
+            // wall-clock ceiling across all TLS probes; primary is the main handshake;
+            // probe is each secondary probe. primary/probe are clamped to <= budget.
+            'tls_phase_budget'    => max(5, min(120, (int)secscan_env('SECSCAN_TLS_PHASE_BUDGET', '25'))),
+            'tls_primary_timeout' => max(2, min(60,  (int)secscan_env('SECSCAN_TLS_PRIMARY_TIMEOUT', '10'))),
+            'tls_probe_timeout'   => max(1, min(30,  (int)secscan_env('SECSCAN_TLS_PROBE_TIMEOUT', '5'))),
             // Owner/admin IP allowlist that may scan without consuming the public
             // per-IP scan quota. Comma-separated IPs or CIDR ranges.
             'owner_bypass_ips' => secscan_env('SECSCAN_OWNER_BYPASS_IPS', ''),
@@ -157,12 +170,39 @@ function secscan_config(?string $key = null)
             // allowlist this scanner in their WAF/firewall before scanning.
             'scanner_public_domain' => secscan_env('SECSCAN_SCANNER_PUBLIC_DOMAIN', ''),
             'scanner_public_ips' => secscan_env('SECSCAN_SCANNER_PUBLIC_IPS', ''),
+            // Scanner execution mode. "remote" sends signed scan jobs to a VPS
+            // worker; "local" keeps the current all-in-one deployment.
+            'scanner_mode' => secscan_env('SECSCAN_SCANNER_MODE', 'local') === 'remote' ? 'remote' : 'local',
+            'worker_url' => secscan_env('SECSCAN_WORKER_URL', ''),
+            'worker_shared_secret' => secscan_env('SECSCAN_WORKER_SHARED_SECRET', ''),
+            'worker_timeout' => max(30, min(600, (int)secscan_env('SECSCAN_WORKER_TIMEOUT', '240'))),
+            'worker_scan_timeout' => max(60, min(900, (int)secscan_env('SECSCAN_WORKER_SCAN_TIMEOUT', '300'))),
+            'worker_max_response_bytes' => max(262144, min(16777216, (int)secscan_env('SECSCAN_WORKER_MAX_RESPONSE_BYTES', '8388608'))),
+            // Optional IP/CIDR allowlist on the VPS worker. HMAC authentication
+            // remains mandatory; use this as a network-level second control.
+            'worker_allowed_callers' => secscan_env('SECSCAN_WORKER_ALLOWED_CALLERS', ''),
             // Authenticated scanning: accept per-request session cookies / auth
             // headers so scans can run behind a login. OFF by default because a
             // public, unauthenticated API endpoint that forwards arbitrary
             // credentials to arbitrary hosts is an abuse vector — enable this
             // only on access-controlled deployments.
             'allow_auth_scan' => secscan_env('SECSCAN_ALLOW_AUTH_SCAN', '0') === '1',
+            // Active non-destructive probes: open redirect, CRLF/header
+            // injection, host-header injection, reflected input, error-based SQL
+            // injection and path traversal. These send crafted but harmless
+            // requests (unique markers / quote characters / traversal paths) and
+            // never exploit, upload, write, or brute-force. Disable on a fully
+            // public scanner if the legal scope does not cover active probing.
+            'allow_active_probes' => secscan_env('SECSCAN_ALLOW_ACTIVE_PROBES', '1') === '1',
+            // Bound how many requests the extended probes may issue per scan so
+            // a large site cannot turn a scan into a flood. The full designed
+            // probe set needs ~95 requests; probes are run in parallel batches.
+            'active_probe_max_requests' => max(4, min(240, (int)secscan_env('SECSCAN_ACTIVE_PROBE_MAX_REQUESTS', '120'))),
+            // Contact messages are encrypted at rest using a dedicated 32-byte
+            // base64 key. Leave blank to keep the public contact form disabled.
+            'contact_encryption_key' => secscan_env('SECSCAN_CONTACT_ENCRYPTION_KEY', ''),
+            'contact_mail_to' => secscan_env('SECSCAN_CONTACT_MAIL_TO', ''),
+            'contact_mail_from' => secscan_env('SECSCAN_CONTACT_MAIL_FROM', ''),
         ];
     }
 
@@ -383,11 +423,33 @@ function secscan_auto_owner_bypass_entries(): array
     if (!$fp) {
         return [];
     }
+    @chmod($file, 0600);
 
-    flock($fp, LOCK_EX);
-    rewind($fp);
+    if (!flock($fp, LOCK_EX)) {
+        fclose($fp);
+        return [];
+    }
+    if (!rewind($fp)) {
+        flock($fp, LOCK_UN);
+        fclose($fp);
+        return [];
+    }
     $raw = stream_get_contents($fp);
-    $entries = is_string($raw) && $raw !== '' ? (json_decode($raw, true) ?: []) : [];
+    if ($raw === false) {
+        flock($fp, LOCK_UN);
+        fclose($fp);
+        return [];
+    }
+    $entries = [];
+    if ($raw !== '') {
+        $decoded = json_decode($raw, true);
+        if (!is_array($decoded) || json_last_error() !== JSON_ERROR_NONE) {
+            flock($fp, LOCK_UN);
+            fclose($fp);
+            return [];
+        }
+        $entries = $decoded;
+    }
     $now = time();
     $clean = [];
     foreach ($entries as $ip => $expires) {
@@ -396,9 +458,13 @@ function secscan_auto_owner_bypass_entries(): array
         }
     }
     if ($clean !== $entries) {
-        ftruncate($fp, 0);
-        rewind($fp);
-        fwrite($fp, json_encode($clean, JSON_UNESCAPED_SLASHES));
+        $payload = json_encode($clean, JSON_UNESCAPED_SLASHES);
+        if (is_string($payload) && ftruncate($fp, 0) && rewind($fp)) {
+            $written = fwrite($fp, $payload);
+            if ($written === strlen($payload)) {
+                fflush($fp);
+            }
+        }
     }
     flock($fp, LOCK_UN);
     fclose($fp);
@@ -423,11 +489,33 @@ function secscan_remember_owner_bypass_ip(string $ip, ?int $ttl = null): bool
     if (!$fp) {
         return false;
     }
+    @chmod($file, 0600);
 
-    flock($fp, LOCK_EX);
-    rewind($fp);
+    if (!flock($fp, LOCK_EX)) {
+        fclose($fp);
+        return false;
+    }
+    if (!rewind($fp)) {
+        flock($fp, LOCK_UN);
+        fclose($fp);
+        return false;
+    }
     $raw = stream_get_contents($fp);
-    $entries = is_string($raw) && $raw !== '' ? (json_decode($raw, true) ?: []) : [];
+    if ($raw === false) {
+        flock($fp, LOCK_UN);
+        fclose($fp);
+        return false;
+    }
+    $entries = [];
+    if ($raw !== '') {
+        $decoded = json_decode($raw, true);
+        if (!is_array($decoded) || json_last_error() !== JSON_ERROR_NONE) {
+            flock($fp, LOCK_UN);
+            fclose($fp);
+            return false;
+        }
+        $entries = $decoded;
+    }
     $now = time();
     $clean = [];
     foreach ($entries as $entryIp => $entryExpires) {
@@ -436,13 +524,16 @@ function secscan_remember_owner_bypass_ip(string $ip, ?int $ttl = null): bool
         }
     }
     $clean[$ip] = $expires;
-    ftruncate($fp, 0);
-    rewind($fp);
-    fwrite($fp, json_encode($clean, JSON_UNESCAPED_SLASHES));
+    $payload = json_encode($clean, JSON_UNESCAPED_SLASHES);
+    $persisted = is_string($payload)
+        && ftruncate($fp, 0)
+        && rewind($fp)
+        && fwrite($fp, $payload) === strlen($payload)
+        && fflush($fp);
     flock($fp, LOCK_UN);
     fclose($fp);
 
-    return true;
+    return $persisted;
 }
 
 function secscan_forget_owner_bypass_ip(string $ip): void
@@ -459,15 +550,41 @@ function secscan_forget_owner_bypass_ip(string $ip): void
     if (!$fp) {
         return;
     }
+    @chmod($file, 0600);
 
-    flock($fp, LOCK_EX);
-    rewind($fp);
+    if (!flock($fp, LOCK_EX)) {
+        fclose($fp);
+        return;
+    }
+    if (!rewind($fp)) {
+        flock($fp, LOCK_UN);
+        fclose($fp);
+        return;
+    }
     $raw = stream_get_contents($fp);
-    $entries = is_string($raw) && $raw !== '' ? (json_decode($raw, true) ?: []) : [];
+    if ($raw === false) {
+        flock($fp, LOCK_UN);
+        fclose($fp);
+        return;
+    }
+    $entries = [];
+    if ($raw !== '') {
+        $decoded = json_decode($raw, true);
+        if (!is_array($decoded) || json_last_error() !== JSON_ERROR_NONE) {
+            flock($fp, LOCK_UN);
+            fclose($fp);
+            return;
+        }
+        $entries = $decoded;
+    }
     unset($entries[$ip]);
-    ftruncate($fp, 0);
-    rewind($fp);
-    fwrite($fp, json_encode($entries, JSON_UNESCAPED_SLASHES));
+    $payload = json_encode($entries, JSON_UNESCAPED_SLASHES);
+    if (is_string($payload) && ftruncate($fp, 0) && rewind($fp)) {
+        $written = fwrite($fp, $payload);
+        if ($written === strlen($payload)) {
+            fflush($fp);
+        }
+    }
     flock($fp, LOCK_UN);
     fclose($fp);
 }

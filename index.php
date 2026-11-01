@@ -7,6 +7,16 @@ require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/src/RateLimiter.php';
 require_once __DIR__ . '/src/UrlGuard.php';
 
+header_remove('X-Powered-By');
+$requestMethod = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+if (!in_array($requestMethod, ['GET', 'HEAD', 'POST'], true)) {
+    header('Allow: GET, HEAD, POST');
+    header('X-Content-Type-Options: nosniff');
+    header('Cache-Control: no-store');
+    http_response_code(405);
+    exit;
+}
+
 $sendSecurityHeaders = static function (): void {
     if (headers_sent()) {
         return;
@@ -58,7 +68,7 @@ $sendSecurityHeaders = static function (): void {
 
 
 // Handle AJAX scan request — guna scanner.php penuh (30+ checks), bukan mini scanner 12 checks
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && strtolower($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '') === 'xmlhttprequest') {
+if ($requestMethod === 'POST' && strtolower($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '') === 'xmlhttprequest') {
     set_time_limit(120);
     ini_set('max_execution_time', '120');
     ob_start();
@@ -126,7 +136,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && strtolower($_SERVER['HTTP_X_REQUEST
     if ($rawBody === null) {
         $sendJson(['error' => 'Request terlalu besar.'], 413);
     }
-    $input   = json_decode($rawBody, true);
+    $input = $rawBody !== '' ? json_decode($rawBody, true) : [];
+    if (!is_array($input) || ($rawBody !== '' && json_last_error() !== JSON_ERROR_NONE)) {
+        if ($_POST === []) {
+            $sendJson(['error' => 'Request JSON tidak sah.'], 400);
+        }
+        $input = [];
+    }
     $target  = UrlGuard::normalizeAndValidate((string)($input['url'] ?? $_POST['url'] ?? $_GET['url'] ?? ''));
     if (!$target['ok']) {
         $sendJson(['error' => $target['error']], (int)$target['status']);
@@ -136,33 +152,44 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && strtolower($_SERVER['HTTP_X_REQUEST
     $enforceScanRateLimit();
 
     try {
-        $scannerPath = __DIR__ . '/scanner.php';
-        if (!is_file($scannerPath)) {
-            $sendJson(['error' => 'scanner.php tidak dijumpai dalam folder yang sama dengan index.php.'], 500);
-        }
-
-        require_once $scannerPath;
-
-        if (!class_exists('SecurityScanner')) {
-            $sendJson(['error' => 'Class SecurityScanner tidak dijumpai dalam scanner.php.'], 500);
-        }
-
-        $scanner = new SecurityScanner($target['url']);
-
         // Authenticated scanning (opt-in via SECSCAN_ALLOW_AUTH_SCAN=1).
+        $authCookie = '';
+        $authHeaders = [];
         if (secscan_config('allow_auth_scan')) {
-            $authCookie  = trim((string)($input['auth_cookie'] ?? ''));
+            $authCookie = trim((string)($input['auth_cookie'] ?? ''));
             $authHeaders = $input['auth_headers'] ?? [];
             if (!is_array($authHeaders)) $authHeaders = [];
             if ($authCookie !== '' || $authHeaders !== []) {
                 if (($target['scheme'] ?? '') !== 'https') {
                     $sendJson(['error' => 'Authenticated scan memerlukan URL HTTPS yang sah.'], 400);
                 }
-                $scanner->setAuth($authHeaders, $authCookie);
             }
         }
 
-        $result  = $scanner->scan();
+        if (secscan_config('scanner_mode') === 'remote') {
+            require_once __DIR__ . '/src/RemoteScannerClient.php';
+            $client = new RemoteScannerClient(
+                (string)secscan_config('worker_url'),
+                (string)secscan_config('worker_shared_secret'),
+                (int)secscan_config('worker_timeout'),
+                (int)secscan_config('worker_max_response_bytes')
+            );
+            $result = $client->scan((string)$target['url'], $authHeaders, $authCookie);
+        } else {
+            $scannerPath = __DIR__ . '/scanner.php';
+            if (!is_file($scannerPath)) {
+                $sendJson(['error' => 'scanner.php tidak dijumpai dalam folder yang sama dengan index.php.'], 500);
+            }
+            require_once $scannerPath;
+            if (!class_exists('SecurityScanner')) {
+                $sendJson(['error' => 'Class SecurityScanner tidak dijumpai dalam scanner.php.'], 500);
+            }
+            $scanner = new SecurityScanner((string)$target['url']);
+            if ($authCookie !== '' || $authHeaders !== []) {
+                $scanner->setAuth($authHeaders, $authCookie);
+            }
+            $result = $scanner->scan();
+        }
 
         if (!is_array($result)) {
             $sendJson(['error' => 'scanner.php tidak memulangkan array result yang sah.'], 500);
@@ -251,6 +278,8 @@ $appVersion = secscan_app_version();
           </div>
         </a>
         <div class="header-actions">
+          <a class="dashboard-link" href="faqs.php">FAQ</a>
+          <a class="dashboard-link" href="about.php">Tentang</a>
           <a class="dashboard-link" href="server-audit.php">Audit Server</a>
           <a class="dashboard-link" href="dashboard.php">Papan Pemuka</a>
           <div class="live-badge">
@@ -322,25 +351,33 @@ $appVersion = secscan_app_version();
           <div class="scan-status" id="termStatus"></div>
 
 <?php if ($scannerAllowlistConfigured): ?>
-          <div class="allowlist-panel">
-            <div class="allowlist-kicker">Allowlist sebelum scan</div>
-            <div class="allowlist-grid">
-              <div class="allowlist-item">
-                <span>Domain scanner</span>
-                <strong><?= htmlspecialchars((string)($scannerIdentity['domain'] ?? '') ?: 'Belum dikonfigurasi', ENT_QUOTES, 'UTF-8') ?></strong>
+          <details class="allowlist-panel">
+            <summary class="allowlist-toggle">
+              <span class="allowlist-toggle-show">Tunjuk allowlist sebelum scan</span>
+              <span class="allowlist-toggle-hide">Sembunyikan allowlist sebelum scan</span>
+              <svg class="allowlist-toggle-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="m8 10 4 4 4-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </summary>
+            <div class="allowlist-content">
+              <div class="allowlist-grid">
+                <div class="allowlist-item">
+                  <span>Domain scanner</span>
+                  <strong><?= htmlspecialchars((string)($scannerIdentity['domain'] ?? '') ?: 'Belum dikonfigurasi', ENT_QUOTES, 'UTF-8') ?></strong>
+                </div>
+                <div class="allowlist-item">
+                  <span>IP server scanner</span>
+                  <strong><?= htmlspecialchars(!empty($scannerIdentity['ips']) ? implode(', ', $scannerIdentity['ips']) : 'Belum dikonfigurasi', ENT_QUOTES, 'UTF-8') ?></strong>
+                </div>
               </div>
-              <div class="allowlist-item">
-                <span>IP server scanner</span>
-                <strong><?= htmlspecialchars(!empty($scannerIdentity['ips']) ? implode(', ', $scannerIdentity['ips']) : 'Belum dikonfigurasi', ENT_QUOTES, 'UTF-8') ?></strong>
+              <div class="allowlist-note">
+                Minta pemilik target allowlist nilai ini pada WAF/firewall sebelum scan jika target ada bot protection.
+                <?php if ($scannerAllowlistText !== ''): ?>
+                  <button type="button" class="allowlist-copy" data-copy="<?= htmlspecialchars($scannerAllowlistText, ENT_QUOTES, 'UTF-8') ?>">Salin</button>
+                <?php endif; ?>
               </div>
             </div>
-            <div class="allowlist-note">
-              Minta pemilik target allowlist nilai ini pada WAF/firewall sebelum scan jika target ada bot protection.
-              <?php if ($scannerAllowlistText !== ''): ?>
-                <button type="button" class="allowlist-copy" data-copy="<?= htmlspecialchars($scannerAllowlistText, ENT_QUOTES, 'UTF-8') ?>">Salin</button>
-              <?php endif; ?>
-            </div>
-          </div>
+          </details>
 <?php endif; ?>
 
 <?php if (secscan_config('allow_auth_scan')): ?>
@@ -556,6 +593,8 @@ $appVersion = secscan_app_version();
         <a href="#terma" data-legal-modal="terms">Terma</a>
         <a href="#privasi" data-legal-modal="privacy">Privasi</a>
         <a href="#penafian" data-legal-modal="disclaimer">Penafian</a>
+        <a href="faqs.php">FAQ</a>
+        <a href="about.php">Tentang</a>
         <a href="server-audit.php">Audit Server</a>
         <a href="dashboard.php">Papan Pemuka</a>
       </nav>

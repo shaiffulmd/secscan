@@ -14,10 +14,15 @@
   "scripts": {
     "check": "php scripts/check.php",
     "preflight": "php scripts/preflight.php",
+    "scan:security": "php scripts/security_scan.php",
+    "test:security-scan": "php scripts/test_codebase_scanner.php",
+    "test:rate-limit": "php scripts/test_rate_limiter.php",
+    "test:storage": "php scripts/test_storage.php",
     "test:baseline": "php scripts/test_baseline.php",
     "test:regression": "php scripts/test_regression.php",
     "test:detection": "php scripts/test_detection.php",
     "test:joomla": "php scripts/test_joomla_fingerprint.php",
+    "test:worker": "php scripts/test_worker_protocol.php",
     "test": "php scripts/test_regression.php"
   }
 }

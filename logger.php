@@ -42,11 +42,25 @@ class ScanLogger
             $this->pdo->exec('PRAGMA journal_mode=WAL');
             $this->pdo->exec('PRAGMA synchronous=NORMAL');
             $this->pdo->exec('PRAGMA foreign_keys=ON');
+            $this->pdo->exec('PRAGMA busy_timeout=5000');
             $this->migrate();
+
+            // WAL/SHM files are normally created by the PRAGMAs or migration,
+            // so apply private modes after those operations as well as to DB.
+            $this->hardenRuntimeFiles();
             return true;
         } catch (Throwable $e) {
             error_log('[SecScan Logger] DB connect failed: ' . $e->getMessage());
             return false;
+        }
+    }
+
+    private function hardenRuntimeFiles(): void
+    {
+        foreach ([$this->dbPath, $this->dbPath . '-wal', $this->dbPath . '-shm'] as $runtimeFile) {
+            if (is_file($runtimeFile)) {
+                @chmod($runtimeFile, 0600);
+            }
         }
     }
 
@@ -73,6 +87,8 @@ class ScanLogger
                 detected_cms_version TEXT,
                 scan_blocked  INTEGER NOT NULL DEFAULT 0,
                 scan_blocked_type TEXT,
+                assessment_status TEXT NOT NULL DEFAULT 'complete',
+                assessment_reason TEXT,
                 waf_vendors   TEXT,
                 waf_signals   TEXT,
                 is_cloudflare INTEGER NOT NULL DEFAULT 0,
@@ -88,10 +104,29 @@ class ScanLogger
         $this->ensureColumn('scans', 'detected_cms_version', 'TEXT');
         $this->ensureColumn('scans', 'scan_blocked', 'INTEGER NOT NULL DEFAULT 0');
         $this->ensureColumn('scans', 'scan_blocked_type', 'TEXT');
+        $this->ensureColumn('scans', 'assessment_status', "TEXT NOT NULL DEFAULT 'complete'");
+        $this->ensureColumn('scans', 'assessment_reason', 'TEXT');
         $this->ensureColumn('scans', 'waf_vendors', 'TEXT');
         $this->ensureColumn('scans', 'waf_signals', 'TEXT');
         $this->ensureColumn('scans', 'is_cloudflare', 'INTEGER NOT NULL DEFAULT 0');
         $this->ensureColumn('scans', 'top_issues', 'TEXT');
+
+        $this->pdo->exec("UPDATE scans SET assessment_status = 'unavailable' WHERE grade = 'N/A' AND assessment_status = 'complete'");
+        $this->pdo->exec("
+            UPDATE scans
+            SET grade = 'N/A',
+                assessment_status = 'unavailable',
+                assessment_reason = COALESCE(NULLIF(assessment_reason, ''),
+                    CASE WHEN scan_blocked = 1
+                        THEN 'Historical scan was blocked by a WAF, captcha, or validation page.'
+                        ELSE 'Historical scan did not complete target reachability checks.'
+                    END)
+            WHERE grade = 'F'
+              AND (
+                  scan_blocked = 1
+                  OR (total_checks <= 3 AND top_issues LIKE '%Reachability%')
+              )
+        ");
 
         $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_scanned_at ON scans(scanned_at)");
         $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_hostname   ON scans(hostname)");
@@ -99,6 +134,85 @@ class ScanLogger
         $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_client_ip  ON scans(client_ip)");
         $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_ip_hash    ON scans(client_ip_hash)");
         $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_country    ON scans(client_country)");
+
+        $this->pdo->exec("CREATE TABLE IF NOT EXISTS contact_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            payload_enc TEXT NOT NULL,
+            iv TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            mail_sent INTEGER NOT NULL DEFAULT 0
+        )");
+        $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_contact_received ON contact_messages(received_at)");
+    }
+
+    /** Store a Contact Us submission as AES-256-GCM encrypted JSON. */
+    public function storeContactMessage(array $message, string $key): ?int
+    {
+        if (!$this->connect() || strlen($key) !== 32) return null;
+        try {
+            $iv = random_bytes(12);
+            $tag = '';
+            $json = json_encode($message, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+            $cipher = openssl_encrypt($json, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag);
+            if ($cipher === false || $tag === '') return null;
+            $stmt = $this->pdo->prepare('INSERT INTO contact_messages (payload_enc, iv, tag) VALUES (?, ?, ?)');
+            $stmt->execute([base64_encode($cipher), base64_encode($iv), base64_encode($tag)]);
+            $this->hardenRuntimeFiles();
+            return (int)$this->pdo->lastInsertId();
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public function markContactMailSent(int $id): void
+    {
+        if (!$this->connect() || $id < 1) return;
+        try {
+            $stmt = $this->pdo->prepare('UPDATE contact_messages SET mail_sent = 1 WHERE id = ?');
+            $stmt->execute([$id]);
+            $this->hardenRuntimeFiles();
+        } catch (Throwable $e) {
+            error_log('[SecScan Logger] Contact mail status update failed: ' . $e->getMessage());
+        }
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function getContactMessages(string $key, int $limit = 30): array
+    {
+        if (!$this->connect() || strlen($key) !== 32) return [];
+        try {
+            $stmt = $this->pdo->prepare('SELECT id, received_at, payload_enc, iv, tag, mail_sent FROM contact_messages ORDER BY id DESC LIMIT ?');
+            $stmt->bindValue(1, max(1, min(100, $limit)), PDO::PARAM_INT);
+            $stmt->execute();
+            $items = [];
+            foreach ($stmt->fetchAll() as $row) {
+                $plain = openssl_decrypt((string)base64_decode((string)$row['payload_enc'], true), 'aes-256-gcm', $key, OPENSSL_RAW_DATA, (string)base64_decode((string)$row['iv'], true), (string)base64_decode((string)$row['tag'], true));
+                $payload = is_string($plain) ? json_decode($plain, true) : null;
+                if (!is_array($payload)) continue;
+                $items[] = ['id' => (int)$row['id'], 'received_at' => (string)$row['received_at'], 'mail_sent' => (int)$row['mail_sent']] + $payload;
+            }
+            return $items;
+        } catch (Throwable) {
+            return [];
+        }
+    }
+
+    /** Delete selected encrypted contact records; dashboard authentication is enforced by the caller. */
+    public function deleteContactMessages(array $ids): int
+    {
+        if (!$this->connect()) return 0;
+        $ids = array_values(array_unique(array_filter(array_map('intval', $ids), static fn(int $id): bool => $id > 0)));
+        if ($ids === []) return 0;
+        try {
+            $placeholders = implode(',', array_fill(0, count($ids), '?'));
+            $stmt = $this->pdo->prepare("DELETE FROM contact_messages WHERE id IN ({$placeholders})");
+            $stmt->execute($ids);
+            $this->hardenRuntimeFiles();
+            return $stmt->rowCount();
+        } catch (Throwable) {
+            return 0;
+        }
     }
 
     private function ensureColumn(string $table, string $column, string $definition): void
@@ -150,8 +264,9 @@ class ScanLogger
                     (hostname, url, score, grade, passed, warnings, critical, info,
                      total_checks, duration_ms, client_ip, client_ip_hash, client_country, tls_protocol,
                      detected_cms, detected_cms_version, scan_blocked, scan_blocked_type,
+                     assessment_status, assessment_reason,
                      waf_vendors, waf_signals, is_cloudflare, top_issues)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ");
 
             $stmt->execute([
@@ -173,11 +288,14 @@ class ScanLogger
                 $result['detected_cms_version'] ?? null,
                 !empty($result['scan_blocked']) ? 1 : 0,
                 $result['scan_blocked_type']    ?? null,
+                $result['assessment_status']    ?? 'complete',
+                $result['assessment_reason']    ?? null,
                 json_encode($wafVendors, JSON_UNESCAPED_UNICODE),
                 json_encode($wafSignals, JSON_UNESCAPED_UNICODE),
                 $isCloudflare ? 1 : 0,
                 json_encode(array_slice($topIssues, 0, 15), JSON_UNESCAPED_UNICODE),
             ]);
+            $this->hardenRuntimeFiles();
         } catch (Throwable $e) {
             error_log('[SecScan Logger] Log failed: ' . $e->getMessage());
         }
@@ -194,13 +312,14 @@ class ScanLogger
             $row = $this->pdo->query("
                 SELECT
                     COUNT(*)                                      AS total_scans,
-                    ROUND(AVG(score), 1)                          AS avg_score,
+                    ROUND(AVG(CASE WHEN grade IN ('A+','A','B','C','D','F') THEN score END), 1) AS avg_score,
                     COUNT(DISTINCT client_ip_hash)                AS unique_ips,
                     SUM(CASE WHEN date(scanned_at) = date('now') THEN 1 ELSE 0 END) AS scans_today,
                     ROUND(AVG(duration_ms) / 1000.0, 1)           AS avg_duration_s,
                     SUM(CASE WHEN grade IN ('A+','A') THEN 1 ELSE 0 END) AS grade_a_count,
-                    SUM(critical)                                 AS total_critical,
-                    SUM(CASE WHEN critical > 0 THEN 1 ELSE 0 END) AS scans_with_criticals,
+                    SUM(CASE WHEN grade IN ('A+','A','B','C','D','F') THEN critical ELSE 0 END) AS total_critical,
+                    SUM(CASE WHEN grade IN ('A+','A','B','C','D','F') AND critical > 0 THEN 1 ELSE 0 END) AS scans_with_criticals,
+                    SUM(CASE WHEN grade NOT IN ('A+','A','B','C','D','F') THEN 1 ELSE 0 END) AS unassessed_total,
                     SUM(CASE WHEN scan_blocked = 1 THEN 1 ELSE 0 END) AS scan_blocked_total,
                     SUM(CASE WHEN waf_vendors IS NOT NULL AND waf_vendors <> '' AND waf_vendors <> '[]' THEN 1 ELSE 0 END) AS waf_detected_total
                 FROM scans
@@ -259,7 +378,9 @@ class ScanLogger
         try {
             $limit = max(1, min(100, $limit));
             return $this->pdo->query(
-                "SELECT s.client_country AS country, COUNT(*) AS cnt, ROUND(AVG(s.score), 1) AS avg_score, MAX(s.scanned_at) AS last_scan
+                "SELECT s.client_country AS country, COUNT(*) AS cnt,
+                        ROUND(AVG(CASE WHEN s.grade IN ('A+','A','B','C','D','F') THEN s.score END), 1) AS avg_score,
+                        MAX(s.scanned_at) AS last_scan
                  FROM scans s
                  LEFT JOIN scans newer ON newer.hostname = s.hostname
                     AND (newer.scanned_at > s.scanned_at OR (newer.scanned_at = s.scanned_at AND newer.id > s.id))
@@ -279,7 +400,8 @@ class ScanLogger
         if (!$this->connect()) return [];
         try {
             return $this->pdo->query(
-                "SELECT s.client_country AS country, s.grade, COUNT(*) AS cnt, ROUND(AVG(s.score), 1) AS avg_score
+                "SELECT s.client_country AS country, s.grade, COUNT(*) AS cnt,
+                        ROUND(AVG(CASE WHEN s.grade IN ('A+','A','B','C','D','F') THEN s.score END), 1) AS avg_score
                  FROM scans s
                  LEFT JOIN scans newer ON newer.hostname = s.hostname
                     AND (newer.scanned_at > s.scanned_at OR (newer.scanned_at = s.scanned_at AND newer.id > s.id))
@@ -299,18 +421,18 @@ class ScanLogger
         try {
             $limit = max(1, min(100, $limit));
             $offset = max(0, $offset);
-            $allowedGrades = ['A+', 'A', 'B', 'C', 'D', 'F'];
+            $allowedGrades = ['A+', 'A', 'B', 'C', 'D', 'F', 'N/A'];
             $filterGrade = in_array($grade, $allowedGrades, true) ? $grade : null;
             $sql = "SELECT s.hostname, s.url, s.score, s.grade, s.client_country, s.scanned_at,
-                           s.critical, s.warnings
+                           s.critical, s.warnings, s.assessment_status, s.assessment_reason
                     FROM scans s
                     LEFT JOIN scans newer ON newer.hostname = s.hostname
                        AND (newer.scanned_at > s.scanned_at OR (newer.scanned_at = s.scanned_at AND newer.id > s.id))
                     WHERE newer.id IS NULL AND s.hostname IS NOT NULL AND s.hostname <> ''";
             if ($filterGrade !== null) $sql .= ' AND s.grade = :grade';
             $orderBy = match ($sort) {
-                'highest' => 's.score DESC, s.scanned_at DESC, s.id DESC',
-                'lowest' => 's.score ASC, s.scanned_at DESC, s.id DESC',
+                'highest' => "CASE WHEN s.grade = 'N/A' THEN 1 ELSE 0 END ASC, s.score DESC, s.scanned_at DESC, s.id DESC",
+                'lowest' => "CASE WHEN s.grade = 'N/A' THEN 1 ELSE 0 END ASC, s.score ASC, s.scanned_at DESC, s.id DESC",
                 default => 's.scanned_at DESC, s.id DESC',
             };
             $sql .= " ORDER BY {$orderBy} LIMIT :limit OFFSET :offset";
@@ -330,7 +452,7 @@ class ScanLogger
     {
         if (!$this->connect()) return 0;
         try {
-            $allowedGrades = ['A+', 'A', 'B', 'C', 'D', 'F'];
+            $allowedGrades = ['A+', 'A', 'B', 'C', 'D', 'F', 'N/A'];
             $filterGrade = in_array($grade, $allowedGrades, true) ? $grade : null;
             $sql = "SELECT COUNT(*)
                     FROM scans s
@@ -389,9 +511,12 @@ class ScanLogger
     /** @return array{ok:bool,message:string,records:int,backfilled:int} */
     public function updateGeoIp(): array
     {
-        return $this->connect()
-            ? GeoIp::update($this->pdo)
-            : ['ok' => false, 'message' => 'Pangkalan data dashboard tidak dapat dibuka.', 'records' => 0, 'backfilled' => 0];
+        if (!$this->connect()) {
+            return ['ok' => false, 'message' => 'Pangkalan data dashboard tidak dapat dibuka.', 'records' => 0, 'backfilled' => 0];
+        }
+        $result = GeoIp::update($this->pdo);
+        $this->hardenRuntimeFiles();
+        return $result;
     }
 
     public function getTopDomains(int $limit = 10): array
@@ -400,7 +525,8 @@ class ScanLogger
         try {
             $limit = max(1, min(100, $limit));
             return $this->pdo->query("
-                SELECT hostname, COUNT(*) AS cnt, ROUND(AVG(score),1) AS avg_score,
+                SELECT hostname, COUNT(*) AS cnt,
+                       ROUND(AVG(CASE WHEN grade IN ('A+','A','B','C','D','F') THEN score END),1) AS avg_score,
                        MAX(scanned_at) AS last_scan
                 FROM scans
                 GROUP BY hostname
@@ -419,7 +545,7 @@ class ScanLogger
                 SELECT hostname,
                        COUNT(*) AS scan_count,
                        MAX(scanned_at) AS last_scan,
-                       ROUND(AVG(score), 1) AS avg_score,
+                       ROUND(AVG(CASE WHEN grade IN ('A+','A','B','C','D','F') THEN score END), 1) AS avg_score,
                        (
                            SELECT waf_vendors
                            FROM scans AS latest
@@ -447,7 +573,7 @@ class ScanLogger
         try {
             $limit = max(1, min(100, $limit));
             // Parse JSON arrays in top_issues column
-            $rows = $this->pdo->query("SELECT top_issues FROM scans WHERE top_issues IS NOT NULL")->fetchAll();
+            $rows = $this->pdo->query("SELECT top_issues FROM scans WHERE top_issues IS NOT NULL AND grade IN ('A+','A','B','C','D','F')")->fetchAll();
             $counts = [];
             foreach ($rows as $r) {
                 $issues = json_decode($r['top_issues'], true) ?: [];
@@ -493,6 +619,7 @@ class ScanLogger
                 SELECT id, scanned_at, hostname, score, grade, passed, warnings,
                        critical, total_checks, duration_ms, client_ip, client_country, tls_protocol,
                        detected_cms, detected_cms_version, scan_blocked, scan_blocked_type,
+                       assessment_status, assessment_reason,
                        waf_vendors, waf_signals, is_cloudflare
                 FROM scans
                 ORDER BY scanned_at DESC
@@ -515,10 +642,10 @@ class ScanLogger
         try {
             $rows = $this->pdo->query("
                 SELECT
-                    SUM(CASE WHEN score >= 90 THEN 1 ELSE 0 END) AS s90,
-                    SUM(CASE WHEN score >= 70 AND score < 90 THEN 1 ELSE 0 END) AS s70,
-                    SUM(CASE WHEN score >= 50 AND score < 70 THEN 1 ELSE 0 END) AS s50,
-                    SUM(CASE WHEN score < 50 THEN 1 ELSE 0 END) AS s0
+                    SUM(CASE WHEN grade IN ('A+','A','B','C','D','F') AND score >= 90 THEN 1 ELSE 0 END) AS s90,
+                    SUM(CASE WHEN grade IN ('A+','A','B','C','D','F') AND score >= 70 AND score < 90 THEN 1 ELSE 0 END) AS s70,
+                    SUM(CASE WHEN grade IN ('A+','A','B','C','D','F') AND score >= 50 AND score < 70 THEN 1 ELSE 0 END) AS s50,
+                    SUM(CASE WHEN grade IN ('A+','A','B','C','D','F') AND score < 50 THEN 1 ELSE 0 END) AS s0
                 FROM scans
             ")->fetch();
             return $rows ?: [];

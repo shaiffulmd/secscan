@@ -6,34 +6,80 @@
 #     sudo bash audit.sh                 # terminal + laporan HTML
 #     sudo bash audit.sh --no-html       # terminal sahaja
 #     sudo bash audit.sh -o /path.html   # tetapkan lokasi laporan
+#     bash audit.sh --help               # semua pilihan & kod keluar
 #
 #  Skrip ini READ-ONLY: ia hanya membaca konfigurasi dan tidak mengubah apa-apa
 #  pada sistem. Jalankan sebagai root/sudo untuk keputusan paling lengkap.
 # ==============================================================================
 
-set -o pipefail
+set -u -o pipefail
 
 # ---------- Tetapan ----------
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 HTML_OUT=""
 MAKE_HTML=1
+USE_COLOR=1
+
+usage() {
+  cat <<'USAGE'
+SecScan Server Audit — semakan keselamatan read-only untuk Ubuntu/Debian
+
+Penggunaan:
+  sudo bash audit.sh [pilihan]
+
+Pilihan:
+  -o, --output FAIL   Simpan laporan HTML ke FAIL
+      --no-html       Jangan jana laporan HTML
+      --no-color      Matikan warna terminal
+      --version       Papar versi
+  -h, --help          Papar bantuan
+
+Kod keluar:
+  0  Tiada amaran/kritikal    1  Ada amaran
+  2  Ada penemuan kritikal    64 Penggunaan tidak sah
+  73 Laporan HTML tidak dapat dicipta
+USAGE
+}
+
+die_usage() {
+  printf 'Ralat: %s\n\n' "$1" >&2
+  usage >&2
+  exit 64
+}
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --no-html)      MAKE_HTML=0 ;;
-    -o|--output)    HTML_OUT="$2"; shift ;;
-    -h|--help)
-      grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -n 14
-      exit 0 ;;
-    *) echo "Pilihan tidak dikenali: $1" >&2; exit 2 ;;
+    --no-color)     USE_COLOR=0 ;;
+    --version)      printf 'SecScan Server Audit %s\n' "$SCRIPT_VERSION"; exit 0 ;;
+    -o=*|--output=*)
+      HTML_OUT="${1#*=}"
+      [ -n "$HTML_OUT" ] || die_usage "$1 memerlukan nama fail" ;;
+    -o|--output)
+      [ "$#" -ge 2 ] || die_usage "$1 memerlukan nama fail"
+      [ -n "$2" ] || die_usage "$1 memerlukan nama fail"
+      [[ "$2" != -* ]] || die_usage "$1 memerlukan nama fail sebelum pilihan seterusnya"
+      HTML_OUT="$2"; shift ;;
+    -h|--help)      usage; exit 0 ;;
+    --)             shift; [ "$#" -eq 0 ] || die_usage "Argumen kedudukan tidak disokong: $1"; break ;;
+    -*)             die_usage "Pilihan tidak dikenali: $1" ;;
+    *)              die_usage "Argumen kedudukan tidak disokong: $1" ;;
   esac
   shift
 done
 
-[ -z "$HTML_OUT" ] && HTML_OUT="secscan-audit-$(hostname -s 2>/dev/null || echo server)-$(date +%Y%m%d-%H%M%S).html"
+SHORT_HOST="$(hostname -s 2>/dev/null || printf 'server')"
+SAFE_HOST="$(printf '%s' "$SHORT_HOST" | tr -c '[:alnum:]._-' '_')"
+[ -n "$SAFE_HOST" ] || SAFE_HOST="server"
+if [ "$MAKE_HTML" -eq 0 ]; then
+  [ -z "$HTML_OUT" ] || die_usage "--output tidak boleh digabungkan dengan --no-html"
+else
+  [ -z "$HTML_OUT" ] && HTML_OUT="secscan-audit-${SAFE_HOST}-$(date +%Y%m%d-%H%M%S).html"
+  [ "$HTML_OUT" != "-" ] || die_usage "Gunakan nama fail untuk --output; output terminal menggunakan stdout"
+fi
 
 # ---------- Warna terminal ----------
-if [ -t 1 ]; then
+if [ -t 1 ] && [ "$USE_COLOR" -eq 1 ] && [ -z "${NO_COLOR:-}" ]; then
   C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
   C_RED=$'\033[38;5;167m'; C_GRN=$'\033[38;5;71m'
   C_YEL=$'\033[38;5;179m'; C_BLU=$'\033[38;5;74m'; C_CLAY=$'\033[38;5;173m'
@@ -43,7 +89,14 @@ fi
 
 # ---------- Kaunter & simpanan keputusan ----------
 N_CRIT=0; N_WARN=0; N_INFO=0; N_PASS=0
-declare -a ROWS   # setiap entri: severity|kategori|tajuk|butiran|cadangan
+REPORT_ERROR=0
+declare -a ROW_SEVS=() ROW_CATS=() ROW_TITLES=() ROW_DETAILS=() ROW_RECS=()
+HTML_TMP=""
+
+cleanup() {
+  [ -z "${HTML_TMP:-}" ] || rm -f -- "$HTML_TMP"
+}
+trap cleanup EXIT
 
 now_iso() { date '+%Y-%m-%d %H:%M:%S %Z'; }
 
@@ -56,7 +109,11 @@ record() {
     pass)     N_PASS=$((N_PASS+1)) ;;
     *)        N_INFO=$((N_INFO+1)) ;;
   esac
-  ROWS+=("${sev}|${cat}|${title}|${detail}|${rec}")
+  ROW_SEVS+=("$sev")
+  ROW_CATS+=("$cat")
+  ROW_TITLES+=("$title")
+  ROW_DETAILS+=("$detail")
+  ROW_RECS+=("$rec")
 
   local tag color
   case "$sev" in
@@ -68,21 +125,21 @@ record() {
   printf '  %s%s%s  %s%s%s\n' "$color" "$tag" "$C_RESET" "$C_BOLD" "$title" "$C_RESET"
   [ -n "$detail" ] && printf '            %s%s%s\n' "$C_DIM" "$detail" "$C_RESET"
   [ -n "$rec" ] && printf '            %s→ %s%s\n' "$C_CLAY" "$rec" "$C_RESET"
+  return 0
 }
 
 section() { printf '\n%s%s══ %s%s\n' "$C_BOLD" "$C_CLAY" "$1" "$C_RESET"; }
 has() { command -v "$1" >/dev/null 2>&1; }
+service_is_active() { has systemctl && systemctl is-active --quiet "$1" 2>/dev/null; }
 
 # ==============================================================================
 #  Header
 # ==============================================================================
-OS_NAME="$( . /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown OS}" )"
+OS_NAME="$(if [ -r /etc/os-release ]; then . /etc/os-release; fi; printf '%s' "${PRETTY_NAME:-Unknown OS}")"
 KERNEL="$(uname -r)"
 HOSTN="$(hostname -f 2>/dev/null || hostname)"
-UPTIME="$(uptime -p 2>/dev/null | sed 's/^up //')"
 IS_ROOT=0; [ "$(id -u)" = "0" ] && IS_ROOT=1
 
-clear 2>/dev/null || true
 printf '%s%s' "$C_BOLD" "$C_CLAY"
 cat <<'BANNER'
    ____             ____
@@ -105,17 +162,27 @@ fi
 # ==============================================================================
 section "Kemas kini & patch"
 if has apt-get; then
-  UPD="$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst' )"
-  SEC="$(apt-get -s upgrade 2>/dev/null | grep -i '^Inst' | grep -ic security)"
-  if [ "${UPD:-0}" -eq 0 ]; then
-    record pass "Kemas kini" "Sistem terkini" "Tiada pakej menunggu kemas kini." ""
-  elif [ "${SEC:-0}" -gt 0 ]; then
-    record critical "Kemas kini" "$SEC kemas kini keselamatan tertunggak" "$UPD pakej boleh dikemas kini ($SEC berkaitan keselamatan)." "Jalankan: sudo apt update && sudo apt upgrade. Pertimbang unattended-upgrades."
+  APT_SIM="$(LC_ALL=C apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null)" || APT_SIM=""
+  if [ -z "$APT_SIM" ]; then
+    record info "Kemas kini" "Status pakej tidak dapat disemak" "Simulasi apt gagal atau cache pakej tidak tersedia." "Jalankan 'sudo apt update', kemudian audit semula."
+    UPD=0; SEC=0
   else
+    UPD="$(printf '%s\n' "$APT_SIM" | awk '/^Inst /{n++} END{print n+0}')"
+    SEC="$(printf '%s\n' "$APT_SIM" | awk 'BEGIN{IGNORECASE=1} /^Inst / && /security/{n++} END{print n+0}')"
+  fi
+  if [ -n "$APT_SIM" ] && [ "$UPD" -eq 0 ]; then
+    record pass "Kemas kini" "Sistem terkini" "Tiada pakej menunggu kemas kini." ""
+  elif [ "$SEC" -gt 0 ]; then
+    record critical "Kemas kini" "$SEC kemas kini keselamatan tertunggak" "$UPD pakej boleh dikemas kini ($SEC berkaitan keselamatan)." "Jalankan: sudo apt update && sudo apt upgrade. Pertimbang unattended-upgrades."
+  elif [ "$UPD" -gt 0 ]; then
     record warning "Kemas kini" "$UPD pakej belum dikemas kini" "Tiada yang dikelaskan keselamatan, tetapi elok dikemas kini." "Jalankan: sudo apt update && sudo apt upgrade."
   fi
-  if dpkg -l 2>/dev/null | grep -q '^ii  unattended-upgrades'; then
-    record pass "Kemas kini" "unattended-upgrades dipasang" "Patch keselamatan automatik tersedia." ""
+  if dpkg -l 2>/dev/null | grep '^ii  unattended-upgrades' >/dev/null; then
+    if has apt-config && apt-config dump 2>/dev/null | grep -E 'APT::Periodic::Unattended-Upgrade "?1"?;' >/dev/null; then
+      record pass "Kemas kini" "Kemas kini automatik aktif" "unattended-upgrades dipasang dan dijadualkan." ""
+    else
+      record warning "Kemas kini" "unattended-upgrades belum diaktifkan" "Pakej dipasang tetapi jadual automatik tidak dapat disahkan." "Jalankan: sudo dpkg-reconfigure unattended-upgrades."
+    fi
   else
     record warning "Kemas kini" "Tiada kemas kini automatik" "unattended-upgrades tidak dipasang." "Pasang: sudo apt install unattended-upgrades && sudo dpkg-reconfigure unattended-upgrades."
   fi
@@ -130,20 +197,20 @@ fi
 #  2. Firewall
 # ==============================================================================
 section "Firewall"
-if has ufw; then
-  if ufw status 2>/dev/null | grep -qi 'Status: active'; then
-    record pass "Firewall" "UFW aktif" "Firewall UFW sedang berjalan." ""
-  else
-    record critical "Firewall" "UFW tidak aktif" "UFW dipasang tetapi tidak dihidupkan." "Hidupkan: sudo ufw enable (pastikan port SSH dibenarkan dahulu)."
-  fi
+if has ufw && ufw status 2>/dev/null | grep -i '^Status: active' >/dev/null; then
+  record pass "Firewall" "UFW aktif" "Firewall UFW sedang berjalan." ""
+elif has firewall-cmd && firewall-cmd --state 2>/dev/null | grep -i '^running' >/dev/null; then
+  record pass "Firewall" "firewalld aktif" "firewalld sedang berjalan." ""
+elif has nft && nft list ruleset 2>/dev/null | grep -E 'hook[[:space:]]+input|type[[:space:]]+filter' >/dev/null; then
+  record info "Firewall" "Peraturan nftables dikesan" "Ruleset dengan rantaian input/filter dikesan; keberkesanan polisinya perlu disemak." "Sahkan polisi lalai dan ruleset: sudo nft list ruleset."
+elif has iptables && iptables -S 2>/dev/null | grep -E '^-P (INPUT|FORWARD) (DROP|REJECT)|^-A (INPUT|FORWARD) .+ -j (DROP|REJECT)' >/dev/null; then
+  record info "Firewall" "Peraturan iptables dikesan" "Polisi atau peraturan sekatan input dikesan; liputan penuh perlu disemak." "Sahkan ruleset: sudo iptables -S."
+elif [ "$IS_ROOT" -eq 0 ]; then
+  record warning "Firewall" "Status firewall tidak dapat disahkan" "Audit tanpa root mungkin tidak boleh membaca ruleset nftables/iptables." "Jalankan semula dengan sudo."
+elif has ufw; then
+  record critical "Firewall" "UFW tidak aktif" "UFW dipasang tetapi tidak dihidupkan, dan tiada ruleset lain dikesan." "Hidupkan: sudo ufw enable (pastikan port SSH dibenarkan dahulu)."
 elif has firewall-cmd; then
-  if firewall-cmd --state 2>/dev/null | grep -qi running; then
-    record pass "Firewall" "firewalld aktif" "firewalld sedang berjalan." ""
-  else
-    record critical "Firewall" "firewalld tidak aktif" "firewalld dipasang tetapi tidak berjalan." "Hidupkan: sudo systemctl enable --now firewalld."
-  fi
-elif iptables -L -n 2>/dev/null | grep -qE '^(DROP|REJECT)'; then
-  record info "Firewall" "Peraturan iptables dikesan" "Ada peraturan iptables tetapi tiada pengurus firewall mesra pengguna." "Pertimbang UFW untuk pengurusan lebih mudah: sudo apt install ufw."
+  record critical "Firewall" "firewalld tidak aktif" "firewalld dipasang tetapi tidak berjalan, dan tiada ruleset lain dikesan." "Hidupkan: sudo systemctl enable --now firewalld."
 else
   record critical "Firewall" "Tiada firewall dikesan" "Tiada UFW, firewalld, atau peraturan iptables menyekat." "Pasang & konfigur UFW: sudo apt install ufw && sudo ufw default deny incoming && sudo ufw allow OpenSSH && sudo ufw enable."
 fi
@@ -153,30 +220,54 @@ fi
 # ==============================================================================
 section "Konfigurasi SSH"
 SSHD=/etc/ssh/sshd_config
-sshget() { # baca nilai efektif direktif; args: nama
-  { [ -r "$SSHD" ] && grep -Ehi "^[[:space:]]*$1[[:space:]]+" "$SSHD" /etc/ssh/sshd_config.d/*.conf 2>/dev/null; } \
-    | tail -n1 | awk '{print tolower($2)}'
+SSH_EFFECTIVE=""
+if [ -r "$SSHD" ] && has sshd; then
+  SSH_EFFECTIVE="$(sshd -T -C "user=root,host=${HOSTN},addr=127.0.0.1" 2>/dev/null)" || SSH_EFFECTIVE=""
+fi
+sshget() { # baca nilai efektif direktif; args: nama, nilai lalai pilihan
+  local key="$1" default="${2:-}"
+  local key_lc value=""
+  key_lc="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
+  if [ -n "$SSH_EFFECTIVE" ]; then
+    value="$(printf '%s\n' "$SSH_EFFECTIVE" | awk -v key="$key_lc" '$1 == key {print tolower($2); exit}')"
+  elif [ -r "$SSHD" ]; then
+    # Fallback konservatif. sshd -T diutamakan kerana ia memproses Include/Match dan nilai lalai.
+    value="$(awk -v key="$key_lc" 'tolower($1) == key {print tolower($2); exit}' "$SSHD" 2>/dev/null)"
+  fi
+  printf '%s' "${value:-$default}"
 }
 if [ -r "$SSHD" ]; then
-  PRL="$(sshget PermitRootLogin)"
-  if [ "$PRL" = "no" ] || [ "$PRL" = "prohibit-password" ]; then
-    record pass "SSH" "Log masuk root terkawal" "PermitRootLogin = ${PRL}." ""
+  PRL="$(sshget PermitRootLogin prohibit-password)"
+  if [ "$PRL" = "no" ]; then
+    record pass "SSH" "Log masuk root dimatikan" "PermitRootLogin = no." ""
+  elif [ "$PRL" = "prohibit-password" ]; then
+    record warning "SSH" "Root masih boleh masuk dengan kunci" "PermitRootLogin = prohibit-password." "Pertimbang 'PermitRootLogin no' dan gunakan akaun pentadbir berasingan dengan sudo."
   else
-    record critical "SSH" "Log masuk root SSH dibenarkan" "PermitRootLogin = ${PRL:-default(yes)}." "Set 'PermitRootLogin no' dalam $SSHD, kemudian: sudo systemctl restart ssh."
+    record critical "SSH" "Log masuk root SSH dibenarkan" "PermitRootLogin = $PRL." "Set 'PermitRootLogin no' dalam $SSHD, uji 'sudo sshd -t', kemudian muat semula SSH."
   fi
 
-  PWA="$(sshget PasswordAuthentication)"
+  PWA="$(sshget PasswordAuthentication yes)"
   if [ "$PWA" = "no" ]; then
-    record pass "SSH" "Pengesahan kata laluan dimatikan" "Hanya kunci SSH dibenarkan." ""
+    record pass "SSH" "Pengesahan kata laluan dimatikan" "Direktif PasswordAuthentication = no." ""
   else
-    record warning "SSH" "Pengesahan kata laluan dibenarkan" "PasswordAuthentication = ${PWA:-default(yes)}." "Guna kunci SSH dan set 'PasswordAuthentication no' untuk halang brute-force."
+    record warning "SSH" "Pengesahan kata laluan dibenarkan" "PasswordAuthentication = $PWA." "Guna kunci SSH dan set 'PasswordAuthentication no' untuk halang brute-force."
   fi
 
-  SSHPORT="$(sshget Port)"; [ -z "$SSHPORT" ] && SSHPORT=22
+  KBD="$(sshget KbdInteractiveAuthentication yes)"
+  if [ "$KBD" = "yes" ]; then
+    record warning "SSH" "Pengesahan interaktif dibenarkan" "KbdInteractiveAuthentication = yes; ini boleh membenarkan cabaran kata laluan/PAM." "Set 'KbdInteractiveAuthentication no' jika tidak menggunakan MFA berasaskan PAM."
+  fi
+
+  SSHPORT="$(sshget Port 22)"
   record info "SSH" "Port SSH: ${SSHPORT}" "SSH mendengar pada port ${SSHPORT}." "$( [ "$SSHPORT" = "22" ] && echo 'Menukar port bukan langkah keselamatan sebenar, tetapi mengurangkan bising log.' )"
 
-  if [ "$(sshget X11Forwarding)" = "yes" ]; then
+  if [ "$(sshget X11Forwarding yes)" = "yes" ]; then
     record warning "SSH" "X11Forwarding dihidupkan" "Boleh membuka permukaan serangan tidak perlu." "Set 'X11Forwarding no' jika tidak diperlukan."
+  fi
+
+  MAXAUTH="$(sshget MaxAuthTries 6)"
+  if [[ "$MAXAUTH" =~ ^[0-9]+$ ]] && [ "$MAXAUTH" -gt 4 ]; then
+    record warning "SSH" "MaxAuthTries tinggi ($MAXAUTH)" "Lebih banyak cubaan dibenarkan bagi setiap sambungan SSH." "Pertimbang 'MaxAuthTries 3' atau 4, kemudian uji konfigurasi sebelum reload."
   fi
 else
   record info "SSH" "sshd_config tidak dibaca" "Tiada akses baca ke $SSHD (mungkin bukan root, atau SSH tidak dipasang)." "Jalankan sebagai sudo untuk semakan penuh."
@@ -200,7 +291,7 @@ else
   record pass "Pengguna" "Hanya root ber-UID 0" "Tiada akaun superuser tersembunyi." ""
 fi
 
-SUDOERS_NOPW="$(grep -rhE 'NOPASSWD' /etc/sudoers /etc/sudoers.d/ 2>/dev/null | grep -v '^#')"
+SUDOERS_NOPW="$(grep -rhE 'NOPASSWD' /etc/sudoers /etc/sudoers.d/ 2>/dev/null | sed 's/[[:space:]]*#.*$//' | grep -E 'NOPASSWD')"
 if [ -n "$SUDOERS_NOPW" ]; then
   record warning "Pengguna" "sudo tanpa kata laluan" "Ada peraturan NOPASSWD dalam sudoers." "Semak /etc/sudoers.d/. Elakkan NOPASSWD kecuali benar-benar perlu."
 fi
@@ -210,21 +301,39 @@ fi
 # ==============================================================================
 section "Port terbuka & perkhidmatan"
 if has ss; then
-  LISTEN="$(ss -tulnH 2>/dev/null)"
+  LISTEN="$(ss -H -lntu 2>/dev/null)"
+  PUBLIC="$(printf '%s\n' "$LISTEN" | awk '
+    {
+      addr=$5
+      if (addr ~ /^0\.0\.0\.0:/ || addr ~ /^\[::\]:/ || addr ~ /^\*:/) {
+        sub(/^.*:/, "", addr)
+        if (addr ~ /^[0-9]+$/) print addr
+      }
+    }' | sort -un | tr '\n' ' ')"
 elif has netstat; then
   LISTEN="$(netstat -tuln 2>/dev/null | tail -n +3)"
+  PUBLIC="$(printf '%s\n' "$LISTEN" | awk '
+    {
+      addr=$4
+      if (addr ~ /^0\.0\.0\.0:/ || addr ~ /^:::/ || addr ~ /^\*:/) {
+        sub(/^.*:/, "", addr)
+        if (addr ~ /^[0-9]+$/) print addr
+      }
+    }' | sort -un | tr '\n' ' ')"
 else
-  LISTEN=""
+  LISTEN=""; PUBLIC=""
 fi
 if [ -n "$LISTEN" ]; then
-  # port yang mendengar pada semua antara muka (0.0.0.0 / [::])
-  PUBLIC="$(echo "$LISTEN" | grep -Eo '(0\.0\.0\.0|\*|\[::\]):[0-9]+' | grep -Eo '[0-9]+$' | sort -un | tr '\n' ' ')"
   NPUB="$(echo "$PUBLIC" | wc -w | tr -d ' ')"
-  record info "Rangkaian" "${NPUB} port mendengar secara awam" "Port: ${PUBLIC:-tiada}" "Pastikan setiap port ini memang perlu terdedah ke internet; sekat yang lain dengan firewall."
+  record info "Rangkaian" "${NPUB} port mendengar pada semua antaramuka" "Port: ${PUBLIC:-tiada}" "Semak sama ada setiap port diperlukan dan benar-benar dibenarkan oleh firewall. Bind semua antaramuka tidak semestinya boleh dicapai dari internet."
   for risky in 23:Telnet 21:FTP 3306:MySQL 5432:PostgreSQL 6379:Redis 27017:MongoDB 9200:Elasticsearch 11211:Memcached; do
     p="${risky%%:*}"; name="${risky##*:}"
-    if echo " $PUBLIC " | grep -q " $p "; then
-      record critical "Rangkaian" "${name} terdedah (port ${p})" "Perkhidmatan sensitif mendengar pada antara muka awam." "Ikat pada 127.0.0.1 sahaja atau sekat port ${p} dengan firewall. Elak Telnet/FTP sepenuhnya."
+    if [[ " $PUBLIC " == *" $p "* ]]; then
+      if [ "$p" = "21" ] || [ "$p" = "23" ]; then
+        record critical "Rangkaian" "${name} pada semua antaramuka (port ${p})" "Protokol tanpa penyulitan dikesan pada alamat wildcard." "Matikan ${name}; gunakan protokol selamat seperti SSH/SFTP. Sahkan juga peraturan firewall."
+      else
+        record warning "Rangkaian" "${name} pada semua antaramuka (port ${p})" "Perkhidmatan sensitif mendengar pada alamat wildcard; firewall mungkin masih menyekatnya." "Ikat pada loopback/rangkaian persendirian atau hadkan port ${p} dengan firewall."
+      fi
     fi
   done
 else
@@ -235,43 +344,63 @@ fi
 #  6. Fail & keizinan berisiko
 # ==============================================================================
 section "Fail & keizinan"
-WW="$(find /etc /usr/local -xdev -type f -perm -0002 2>/dev/null | head -n 20)"
-if [ -n "$WW" ]; then
-  NW="$(echo "$WW" | wc -l | tr -d ' ')"
-  record warning "Fail" "${NW}+ fail world-writable dalam /etc,/usr/local" "Contoh: $(echo "$WW" | head -n3 | tr '\n' ' ')" "Buang izin tulis umum: sudo chmod o-w <fail>."
+declare -a WW_FILES=()
+while IFS= read -r file; do
+  WW_FILES+=("$file")
+done < <(find /etc /usr/local -xdev -type f -perm -0002 -print 2>/dev/null | head -n 21)
+if [ "${#WW_FILES[@]}" -gt 0 ]; then
+  NW="${#WW_FILES[@]}"; MORE=""
+  if [ "$NW" -gt 20 ]; then NW=20; MORE="+"; fi
+  WW_EXAMPLE="$(printf '%s\n' "${WW_FILES[@]:0:3}" | tr '\n' ' ')"
+  record warning "Fail" "${NW}${MORE} fail world-writable dalam /etc,/usr/local" "Contoh: $WW_EXAMPLE" "Buang izin tulis umum: sudo chmod o-w <fail>."
 else
   record pass "Fail" "Tiada fail world-writable kritikal" "/etc dan /usr/local bersih." ""
 fi
 
 if [ -r /etc/shadow ]; then
-  SHMODE="$(stat -c '%a' /etc/shadow 2>/dev/null)"
-  if [ "$SHMODE" -gt 640 ] 2>/dev/null; then
-    record warning "Fail" "/etc/shadow terlalu terbuka (mod $SHMODE)" "Fail kata laluan patut ketat." "sudo chmod 640 /etc/shadow (atau 600)."
+  SHSTAT="$(stat -c '%a %U %G' /etc/shadow 2>/dev/null || true)"
+  read -r SHMODE SHOWNER SHGROUP <<<"$SHSTAT"
+  SHMODE_DEC=0
+  [[ "${SHMODE:-}" =~ ^[0-7]{3,4}$ ]] && SHMODE_DEC=$((8#$SHMODE))
+  # Benarkan maksimum 0640: rw untuk root dan baca untuk kumpulan shadow/root.
+  if [ "$SHOWNER" != "root" ] || { [ "$SHGROUP" != "shadow" ] && [ "$SHGROUP" != "root" ]; } || (( SHMODE_DEC == 0 || (SHMODE_DEC & ~8#0640) != 0 )); then
+    record warning "Fail" "/etc/shadow pemilikan/izin berisiko" "Mod ${SHMODE:-tidak diketahui}, pemilik ${SHOWNER:-?}:${SHGROUP:-?}." "Pulihkan pemilikan root:shadow dan mod 640 (atau dasar distro yang lebih ketat)."
   else
-    record pass "Fail" "/etc/shadow keizinan betul" "Mod $SHMODE." ""
+    record pass "Fail" "/etc/shadow pemilikan/izin ketat" "Mod $SHMODE, pemilik $SHOWNER:$SHGROUP." ""
   fi
 fi
 
 SUID="$(find / -xdev -type f -perm -4000 2>/dev/null | wc -l | tr -d ' ')"
-record info "Fail" "${SUID} binari SUID dikesan" "SUID membenarkan naik taraf keistimewaan jika dieksploit." "Semak senarai: find / -perm -4000 -type f. Buang SUID yang tidak perlu."
+SUID_NOTE=""; [ "$IS_ROOT" -eq 0 ] && SUID_NOTE=" Kiraan mungkin tidak lengkap tanpa root."
+record info "Fail" "${SUID} binari SUID dikesan" "SUID boleh membenarkan naik taraf keistimewaan jika dieksploit.${SUID_NOTE}" "Semak senarai: sudo find / -xdev -perm -4000 -type f. Buang SUID yang tidak perlu."
 
 # ==============================================================================
 #  7. Perkhidmatan tambahan & pengukuhan
 # ==============================================================================
 section "Pengukuhan tambahan"
-if has fail2ban-client && systemctl is-active --quiet fail2ban 2>/dev/null; then
+if has fail2ban-client && service_is_active fail2ban; then
   record pass "Hardening" "Fail2ban aktif" "Melindungi daripada brute-force." ""
 else
   record warning "Hardening" "Fail2ban tidak aktif" "Tiada perlindungan brute-force automatik." "Pasang: sudo apt install fail2ban && sudo systemctl enable --now fail2ban."
 fi
 
 # SELinux / AppArmor
-if has aa-status && aa-status --enabled 2>/dev/null; then
+if { [ -r /sys/module/apparmor/parameters/enabled ] && grep -q '^Y' /sys/module/apparmor/parameters/enabled; } || { has aa-status && aa-status --enabled 2>/dev/null; }; then
   record pass "Hardening" "AppArmor dihidupkan" "Kawalan akses mandatori aktif." ""
 elif has getenforce && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
   record pass "Hardening" "SELinux Enforcing" "MAC aktif." ""
 else
   record warning "Hardening" "Tiada MAC aktif (AppArmor/SELinux)" "Lapisan kawalan tambahan tiada." "Hidupkan AppArmor: sudo systemctl enable --now apparmor."
+fi
+
+# Masa tepat penting untuk TLS, log korelasi dan pengesahan berasaskan masa.
+if has timedatectl; then
+  NTP_STATE="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+  if [ "$NTP_STATE" = "yes" ]; then
+    record pass "Hardening" "Jam sistem disegerakkan" "Penyegerakan masa rangkaian aktif." ""
+  elif [ "$NTP_STATE" = "no" ]; then
+    record warning "Hardening" "Jam sistem tidak disegerakkan" "timedatectl melaporkan NTPSynchronized=no." "Aktifkan systemd-timesyncd, chrony atau perkhidmatan NTP yang diluluskan."
+  fi
 fi
 
 # ==============================================================================
@@ -298,11 +427,17 @@ printf '  %sKritikal%s %-3s  %sAmaran%s %-3s  %sInfo%s %-3s  %sLulus%s %-3s  (ju
 # ==============================================================================
 if [ "$MAKE_HTML" -eq 1 ]; then
   esc() { sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
-  {
+  OUT_DIR="$(dirname -- "$HTML_OUT")"
+  OUT_BASE="$(basename -- "$HTML_OUT")"
+  HTML_TMP="$(mktemp "${OUT_DIR}/.${OUT_BASE}.tmp.XXXXXX" 2>/dev/null || true)"
+  if [ -z "$HTML_TMP" ]; then
+    REPORT_ERROR=1
+    printf '\n  %s⚠ Gagal mencipta laporan HTML dalam %s%s\n' "$C_YEL" "$OUT_DIR" "$C_RESET"
+  elif {
     cat <<HTMLHEAD
 <!doctype html><html lang="ms"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SecScan Server Audit — ${HOSTN}</title>
+<title>SecScan Server Audit — $(printf '%s' "$HOSTN" | esc)</title>
 <style>
 :root{--bg:#faf9f5;--surface:#fff;--surface2:#f5f4ef;--border:#e4e2d8;--t1:#1f1e1d;--t2:#63615a;--t3:#918e83;--clay:#c96442;--crit:#c63a2f;--warn:#c07e14;--info:#2f74b8;--pass:#4e8a22}
 @media(prefers-color-scheme:dark){:root{--bg:#262624;--surface:#2d2c2a;--surface2:#31302e;--border:#3b3a37;--t1:#f0eee6;--t2:#b3b0a5;--t3:#8a877b;--clay:#d97757;--crit:#cf4b3f;--warn:#c08222;--info:#3d7fbf;--pass:#559130}}
@@ -351,8 +486,9 @@ h1{font-family:'Lora',Georgia,serif;font-weight:500;font-size:1.7rem;margin-bott
 HTMLHEAD
 
     for order in critical warning info pass; do
-      for entry in "${ROWS[@]}"; do
-        IFS='|' read -r sev cat title detail rec <<<"$entry"
+      for i in "${!ROW_SEVS[@]}"; do
+        sev="${ROW_SEVS[$i]}"; cat="${ROW_CATS[$i]}"; title="${ROW_TITLES[$i]}"
+        detail="${ROW_DETAILS[$i]}"; rec="${ROW_RECS[$i]}"
         [ "$sev" != "$order" ] && continue
         case "$sev" in
           critical) bc="b-crit"; lbl="Kritikal" ;;
@@ -369,20 +505,30 @@ HTMLHEAD
     done
 
     cat <<HTMLFOOT
-<div class="foot">Audit read-only — tiada perubahan dibuat pada sistem. Sahkan setiap cadangan sebelum melaksanakan.<br>SecScan Server Audit · ${HOSTN} · $(now_iso | esc)</div>
+<div class="foot">Audit read-only — tiada perubahan dibuat pada sistem. Sahkan setiap cadangan sebelum melaksanakan.<br>SecScan Server Audit · $(printf '%s' "$HOSTN" | esc) · $(now_iso | esc)</div>
 </div></body></html>
 HTMLFOOT
-  } > "$HTML_OUT" 2>/dev/null
-
-  if [ -f "$HTML_OUT" ]; then
-    printf '\n  %s✓ Laporan HTML disimpan:%s %s\n' "$C_GRN" "$C_RESET" "$HTML_OUT"
-    printf '    %sBuka dalam browser atau muat turun fail ini.%s\n' "$C_DIM" "$C_RESET"
+  } > "$HTML_TMP"; then
+    if mv -- "$HTML_TMP" "$HTML_OUT" 2>/dev/null; then
+      HTML_TMP=""
+      printf '\n  %s✓ Laporan HTML disimpan:%s %s\n' "$C_GRN" "$C_RESET" "$HTML_OUT"
+      printf '    %sBuka dalam browser atau muat turun fail ini.%s\n' "$C_DIM" "$C_RESET"
+    else
+      rm -f -- "$HTML_TMP"
+      HTML_TMP=""
+      REPORT_ERROR=1
+      printf '\n  %s⚠ Gagal memindahkan laporan HTML ke %s%s\n' "$C_YEL" "$HTML_OUT" "$C_RESET"
+    fi
   else
+    rm -f -- "$HTML_TMP"
+    HTML_TMP=""
+    REPORT_ERROR=1
     printf '\n  %s⚠ Gagal menulis laporan HTML ke %s%s\n' "$C_YEL" "$HTML_OUT" "$C_RESET"
   fi
 fi
 
-# Kod keluar: 2 jika ada kritikal, 1 jika ada amaran, 0 jika bersih
-if   [ "$N_CRIT" -gt 0 ]; then exit 2
+# Kod keluar penjanaan laporan diutamakan supaya kegagalan -o tidak terlepas pandang.
+if   [ "$REPORT_ERROR" -gt 0 ]; then exit 73
+elif [ "$N_CRIT" -gt 0 ]; then exit 2
 elif [ "$N_WARN" -gt 0 ]; then exit 1
 else exit 0; fi

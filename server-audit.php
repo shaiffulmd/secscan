@@ -53,6 +53,7 @@ $auditHash = hash_file('sha256', __DIR__ . '/audit.sh') ?: '';
         </a>
         <div class="header-actions">
           <a class="dashboard-link" href="index.php">Scanner</a>
+          <a class="dashboard-link" href="faqs.php">FAQ</a>
           <a class="dashboard-link" href="dashboard.php">Papan Pemuka</a>
           <button type="button" class="theme-toggle" id="themeToggle" aria-label="Tukar tema">
             <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none">
@@ -135,6 +136,7 @@ $auditHash = hash_file('sha256', __DIR__ . '/audit.sh') ?: '';
       <span>&copy; 2026 SecScan Enterprise. Hak cipta terpelihara.</span>
       <nav class="footer-links" aria-label="Pautan SecScan">
         <a href="index.php">Scanner</a>
+        <a href="faqs.php">FAQ</a>
         <a href="dashboard.php">Papan Pemuka</a>
       </nav>
     </footer>
